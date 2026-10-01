@@ -78,6 +78,7 @@ struct AgentTask: Identifiable, Equatable {
 enum AgentSource: Equatable {
     case claudeCode
     case n8n
+    case agent   // third-party agent via coucou_agent field
 }
 
 // MARK: - View dimensions (from VIEWS in prototype)

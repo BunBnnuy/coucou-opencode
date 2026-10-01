@@ -64,7 +64,13 @@ struct OverviewView: View {
                                     .lineLimit(1)
                                     .truncationMode(.tail)
                                     .layoutPriority(1)
-                                Text(agent.source == .claudeCode ? agent.agentDetail : "n8n")
+                                Text({ () -> String in
+                                    switch agent.source {
+                                    case .claudeCode: return agent.agentDetail
+                                    case .agent:      return "Agent"
+                                    case .n8n:        return "n8n"
+                                    }
+                                }())
                                     .font(.system(size: 11))
                                     .foregroundColor(Color(hex: "#8E939C"))
                                     .lineLimit(1)

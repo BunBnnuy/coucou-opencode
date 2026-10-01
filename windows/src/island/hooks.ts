@@ -42,6 +42,25 @@ interface HookPayload {
   to_model?: string;
   /** The OpenCode plugin's marker; Claude Code's source is a session-start reason. */
   source?: string;
+  /** Optional agent tag: lowercase, digits and hyphens, ≤ 24 chars. */
+  coucou_agent?: string;
+}
+
+/** Same rule as HookServer.validateAgent on macOS. "claude" is reserved. */
+function validateAgent(raw: string | undefined): string | null {
+  if (!raw || raw.length > 24 || raw === "claude") return null;
+  if (!/^[a-z0-9-]+$/.test(raw)) return null;
+  return raw;
+}
+
+const FALLBACK_COLORS = ["#22C55E", "#EAB308", "#60A5FA", "#E879F9"];
+
+function agentColor(name: string): string {
+  let h = 0;
+  for (let i = 0; i < name.length; i++) {
+    h = (Math.imul(31, h) + name.charCodeAt(i)) | 0;
+  }
+  return FALLBACK_COLORS[Math.abs(h) % FALLBACK_COLORS.length];
 }
 
 const PROJECT_ALIASES: Record<string, string> = {
@@ -173,20 +192,28 @@ function handleHook(island: Island, payload: HookPayload) {
   const projectName = aliasProjectName(raw || "Session");
   // The OpenCode plugin names itself, or is recognised by its `source` marker.
   const agent = payload.agent ?? (payload.source === "opencode" ? "OpenCode" : undefined);
-  const focused = State.focusId === CLAUDE_ID;
+  const model = payload.model ?? payload.to_model;
+
+  // Route to the right pill. Valid coucou_agent → dynamic "agent_<name>" pill.
+  // "claude" is reserved; absent or invalid → Claude Code pill unchanged.
+  const validAgent = validateAgent(payload.coucou_agent);
+  const agentId = validAgent ? `agent_${validAgent}` : CLAUDE_ID;
+  const isExternalAgent = validAgent !== null;
+
+  const focused = State.focusId === agentId;
 
   // A pending question owns the island: another session working must not steal
   // its state — that is what used to make the question (and the floating blob)
   // vanish mid-question. An approval still takes over; it is a quick yes/no.
   const setState = (next: Parameters<typeof State.updateTask>[1]) => {
     if (State.pendingQuestion && next !== "question" && next !== "approval") return;
-    State.updateTask(CLAUDE_ID, next);
+    State.updateTask(agentId, next);
   };
 
   // A step both lands in the ticker and, while the island is shrunk, flashes in
   // the pill for a couple of seconds so progress is visible.
   const noteStep = (text: string) => {
-    State.appendStep(CLAUDE_ID, text);
+    State.appendStep(agentId, text);
     showCompactLine(text);
   };
 
@@ -201,15 +228,24 @@ function handleHook(island: Island, payload: HookPayload) {
     }
   };
 
+  /** Ensure the agent pill exists (no-op for Claude Code). */
+  const ensurePill = () => {
+    if (isExternalAgent) {
+      State.upsertExternalAgent(agentId, validAgent!, agentColor(validAgent!));
+    } else {
+      upsert(projectName, cwd, agent, model);
+    }
+  };
+
   switch (name) {
     case "SessionStart":
-      upsert(projectName, cwd, agent, payload.model ?? payload.to_model);
+      ensurePill();
       surface("overview", false);
       Sound.play("work");
       break;
 
     case "UserPromptSubmit": {
-      upsert(projectName, cwd, agent, payload.model ?? payload.to_model);
+      ensurePill();
       setState("thinking");
       // The field is `prompt`; reading `message` meant this step was always blank.
       const asked = payload.prompt ?? payload.message;
@@ -219,7 +255,7 @@ function handleHook(island: Island, payload: HookPayload) {
     }
 
     case "PreToolUse": {
-      upsert(projectName, cwd, agent, payload.model ?? payload.to_model);
+      ensurePill();
       setState("working");
       const tool = payload.tool_name ?? "Tool";
       noteStep(stepLabel(tool, payload.tool_input ?? {}));
@@ -258,7 +294,7 @@ function handleHook(island: Island, payload: HookPayload) {
 
     // An assistant reply (T3 Code conversations, forwarded by the watcher).
     case "AgentMessage": {
-      upsert(projectName, cwd, agent, payload.model ?? payload.to_model);
+      ensurePill();
       setState("working");
       const reply = (payload.message ?? "").replace(/\s+/g, " ").trim();
       if (reply) noteStep(reply.slice(0, 90));
@@ -267,7 +303,7 @@ function handleHook(island: Island, payload: HookPayload) {
 
     // The agent is asking something (OpenCode's question tool).
     case "Question": {
-      upsert(projectName, cwd, agent, payload.model ?? payload.to_model);
+      ensurePill();
       State.pendingQuestion = {
         id: payload.request_id ?? "",
         text: payload.message ?? "A question needs an answer.",
@@ -286,7 +322,8 @@ function handleHook(island: Island, payload: HookPayload) {
     }
 
     // Answered or rejected, here or in the terminal: drop the card.
-    case "QuestionEnd": {      const pending = State.pendingQuestion;
+    case "QuestionEnd": {
+      const pending = State.pendingQuestion;
       if (!pending) break;
       if (payload.request_id && pending.id && payload.request_id !== pending.id) break;
       State.pendingQuestion = null;
@@ -302,10 +339,14 @@ function handleHook(island: Island, payload: HookPayload) {
       if (payload.message) noteStep(payload.message.slice(0, 60));
       Sound.play("finish");
       if (focused) surface("finished", true);
-      else State.setPillBadge(CLAUDE_ID, "finished");
+      else State.setPillBadge(agentId, "finished");
       window.setTimeout(() => {
-        setState("idle");
-        State.setPillBadge(CLAUDE_ID, null);
+        if (isExternalAgent) {
+          State.removeTask(agentId);
+        } else {
+          setState("idle");
+          State.setPillBadge(agentId, null);
+        }
       }, 5200);
       break;
 
@@ -313,12 +354,16 @@ function handleHook(island: Island, payload: HookPayload) {
       setState("error");
       Sound.play("error");
       if (focused) surface("error", true);
-      else State.setPillBadge(CLAUDE_ID, "error");
+      else State.setPillBadge(agentId, "error");
       break;
 
     case "SessionEnd":
-      setState("idle");
-      clearSession();
+      if (isExternalAgent) {
+        State.removeTask(agentId);
+      } else {
+        setState("idle");
+        clearSession();
+      }
       break;
 
     case "SubagentStart":
@@ -330,6 +375,14 @@ function handleHook(island: Island, payload: HookPayload) {
       break;
 
     case "PermissionRequest": {
+      // External agents do not get an approval card — showing one would look like
+      // a Claude Code request. Decline immediately so the agent re-asks in its
+      // terminal. Approval support for other agents will come with Codex support.
+      if (isExternalAgent) {
+        if (payload.request_id) void Bridge.approvalDecline(payload.request_id);
+        break;
+      }
+
       const requestId = payload.request_id ?? "";
       // One card, one request. A second one must never quietly replace the first
       // — that would leave a human staring at request B while request A waits for
@@ -338,7 +391,7 @@ function handleHook(island: Island, payload: HookPayload) {
         if (requestId) void Bridge.approvalDecline(requestId);
         break;
       }
-      upsert(projectName, cwd, agent, payload.model ?? payload.to_model);
+      upsert(projectName, cwd, agent, model);
       if (pendingTimeout != null) window.clearTimeout(pendingTimeout);
       const tool = payload.tool_name ?? "Tool";
       const input = payload.tool_input ?? {};

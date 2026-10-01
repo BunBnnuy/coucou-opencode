@@ -11,3 +11,5 @@
 - OpenCode 1 and 2 sessions show up in the island and can be approved from the notch, through one plugin shared by the Mac and Windows apps
 - On Windows the island can be dragged anywhere along the top or bottom edge of the screen — it snaps to the nearest edge and remembers where you left it (Settings → Island edge)
 - Windows theme: Dark / Light / Follow Windows, plus a Mochi colour picker
+- Any agent can talk to Mochi: tag a hook payload with `coucou_agent` (e.g. `nb-hook --agent my-agent`) and it gets its own pill in the island (#7, #9) — thanks @lacatu5
+- Gemini CLI and Antigravity (agy) hook support on macOS: install from Settings and their sessions show up in the island — thanks @corefusiion
