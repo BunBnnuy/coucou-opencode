@@ -13,11 +13,7 @@ use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, Monitor, PhysicalPosition, PhysicalSize, WebviewWindow};
 
 use windows::Win32::Foundation::{HWND, POINT};
-use windows::core::BOOL;
-use windows::Win32::Foundation::LPARAM;
-use windows::Win32::System::Ole::RevokeDragDrop;
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LBUTTON};
-use windows::Win32::UI::WindowsAndMessaging::{EnumChildWindows, GetClassNameW};
 use windows::Win32::UI::WindowsAndMessaging::{
     GetCursorPos, GetWindowLongPtrW, SetWindowLongPtrW, GWL_EXSTYLE, WS_EX_NOACTIVATE,
     WS_EX_TOOLWINDOW,
@@ -120,37 +116,23 @@ fn cursor_physical() -> Option<(f64, f64)> {
     Some((p.x as f64, p.y as f64))
 }
 
-/// Lets dropped files reach the app again.
-///
-/// wry installs its drop target by walking the webview's child windows **once**,
-/// when the webview is created. WebView2 creates `Chrome_RenderWidgetHostHWND`
-/// later and registers its own target on it; being the innermost window, that one
-/// wins, and since the page has no HTML5 drop handler it refuses everything — the
-/// "no drop" cursor, with nothing reaching Tauri. Revoking it makes OLE fall
-/// through to the target wry registered on the parent widget, which is the one
-/// that feeds Tauri's drag events.
-///
-/// Cheap and idempotent, so it is simply re-run whenever a drag might be starting.
-pub fn unblock_webview_drops(app: &AppHandle) {
-    for label in [WINDOW_LABEL, "settings"] {
-        let Some(win) = app.get_webview_window(label) else { continue };
-        let Some(hwnd) = hwnd_of(&win) else { continue };
-        unsafe {
-            let _ = EnumChildWindows(Some(hwnd), Some(revoke_render_widget), LPARAM(0));
-        }
-    }
-}
+/// How far from the hidden wake strip the cursor counts as "near" (logical px).
+const WAKE_PAD: f64 = 56.0;
 
-unsafe extern "system" fn revoke_render_widget(hwnd: HWND, _: LPARAM) -> BOOL {
-    let mut name = [0u16; 64];
-    let len = unsafe { GetClassNameW(hwnd, &mut name) };
-    if len > 0 {
-        let class = String::from_utf16_lossy(&name[..len as usize]);
-        if class == "Chrome_RenderWidgetHostHWND" {
-            let _ = unsafe { RevokeDragDrop(hwnd) };
-        }
+/// True while the cursor is within `WAKE_PAD` of the hidden window; emits `wake`
+/// on the far-to-near transition so the island peeks before it is touched.
+fn watch_proximity(app: &AppHandle, was_near: bool) -> bool {
+    let Some(win) = window(app) else { return false };
+    let (Ok(pos), Ok(size)) = (win.outer_position(), win.outer_size()) else { return false };
+    let Some((cx, cy)) = cursor_physical() else { return was_near };
+    let pad = WAKE_PAD * win.scale_factor().unwrap_or(1.0);
+    let (px, py) = (pos.x as f64, pos.y as f64);
+    let (pw, ph) = (size.width as f64, size.height as f64);
+    let near = cx >= px - pad && cx <= px + pw + pad && cy >= py - pad && cy <= py + ph + pad;
+    if near && !was_near {
+        let _ = app.emit_to(WINDOW_LABEL, "wake", ());
     }
-    true.into()
+    near
 }
 
 /// True while the left mouse button is held — the only signal we get that a
@@ -202,7 +184,9 @@ pub fn screen_info(app: &AppHandle, pref: &str) -> ScreenInfo {
     }
 }
 
-/// Places and sizes the window. `collapsed` picks the wake strip instead of the panel.
+/// Places and sizes the window. `collapsed` picks the wake strip instead of the
+/// panel; the anchor and horizontal offset come from the saved settings, so a
+/// dragged island comes back where it was left.
 pub fn apply_geometry(app: &AppHandle, pref: &str, collapsed: bool) {
     let Some(win) = window(app) else { return };
     let Some(m) = target_monitor(app, pref) else { return };
@@ -214,8 +198,22 @@ pub fn apply_geometry(app: &AppHandle, pref: &str, collapsed: bool) {
     let (lw, lh) = if collapsed { (STRIP_W, STRIP_H) } else { (PANEL_W, PANEL_H) };
     let pw = (lw * scale).round().max(1.0) as u32;
     let ph = (lh * scale).round().max(1.0) as u32;
-    let x = mp.x + (ms.width as i32 - pw as i32) / 2;
-    let y = mp.y;
+
+    let (anchor, offset) = app
+        .try_state::<crate::Shared>()
+        .map(|s| {
+            let g = s.settings.lock().unwrap();
+            (g.island_anchor.clone(), g.island_offset_x)
+        })
+        .unwrap_or_else(|| ("top".to_string(), 0.5));
+
+    let centre = mp.x + (ms.width as f64 * offset).round() as i32;
+    let min_x = mp.x;
+    let max_x = (mp.x + ms.width as i32 - pw as i32).max(min_x);
+    let x = (centre - pw as i32 / 2).clamp(min_x, max_x);
+
+    let (work_top, work_bottom) = work_area_for(&m).unwrap_or((mp.y, mp.y + ms.height as i32));
+    let y = if anchor == "bottom" { work_bottom - ph as i32 } else { work_top };
 
     let _ = win.set_size(PhysicalSize::new(pw, ph));
     let _ = win.set_position(PhysicalPosition::new(x, y));
@@ -224,7 +222,54 @@ pub fn apply_geometry(app: &AppHandle, pref: &str, collapsed: bool) {
     let _ = win.set_always_on_top(true);
 }
 
-fn hwnd_of(win: &WebviewWindow) -> Option<HWND> {
+/// Top and bottom of the monitor's work area (the screen minus the taskbar), in
+/// physical pixels. `None` falls back to the full monitor.
+fn work_area_for(m: &Monitor) -> Option<(i32, i32)> {
+    use windows::Win32::Foundation::RECT;
+    use windows::Win32::Graphics::Gdi::{
+        GetMonitorInfoW, MonitorFromRect, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+    };
+
+    let p = m.position();
+    let s = m.size();
+    let rect = RECT {
+        left: p.x,
+        top: p.y,
+        right: p.x + s.width as i32,
+        bottom: p.y + s.height as i32,
+    };
+    unsafe {
+        let hmon = MonitorFromRect(&rect, MONITOR_DEFAULTTONEAREST);
+        let mut info = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        GetMonitorInfoW(hmon, &mut info).as_bool().then_some((info.rcWork.top, info.rcWork.bottom))
+    }
+}
+
+/// Which edge a dragged window ended nearest, and where horizontally (as a
+/// fraction of the monitor width).
+pub fn nearest_anchor(app: &AppHandle, pref: &str, x: i32, y: i32, w: u32, h: u32) -> (String, f64) {
+    let Some(m) = target_monitor(app, pref) else {
+        return ("top".to_string(), 0.5);
+    };
+    let mp = *m.position();
+    let ms = *m.size();
+    let (work_top, work_bottom) = work_area_for(&m).unwrap_or((mp.y, mp.y + ms.height as i32));
+
+    let centre_y = y + h as i32 / 2;
+    let anchor = if centre_y <= (work_top + work_bottom) / 2 { "top" } else { "bottom" };
+    let centre_x = x + w as i32 / 2;
+    // Keep the stored centre where the window can actually sit, so the offset
+    // round-trips: apply_geometry clamps x to the monitor, and an unclamped
+    // offset would otherwise come back to a different place than it was left.
+    let half = (w as f64 / 2.0) / ms.width as f64;
+    let offset = ((centre_x - mp.x) as f64 / ms.width as f64).clamp(half, 1.0 - half);
+    (anchor.to_string(), offset)
+}
+
+pub fn hwnd_of(win: &WebviewWindow) -> Option<HWND> {
     let raw = win.hwnd().ok()?.0 as isize;
     if raw == 0 {
         return None;
@@ -271,15 +316,19 @@ fn current_screen_key(app: &AppHandle) -> Option<(i32, i32, u32, u32, u64)> {
 }
 
 /// Emits `cursor` (window-logical coordinates) at ~60 Hz while the island is
-/// visible. Parked on a condvar the rest of the time.
+/// visible. While hidden it drops to a ~7 Hz proximity watch so the island peeks
+/// when the cursor merely comes *near* the wake strip.
 pub fn spawn_cursor_poll(app: AppHandle, gate: Arc<PollGate>) {
     std::thread::spawn(move || {
-        let mut was_down = false;
-        // Remembered across wakes so a display change while hidden is noticed the
-        // moment the island comes back.
         let mut last_screen: Option<(i32, i32, u32, u32, u64)> = None;
+        let mut was_near = false;
         loop {
-            gate.wait_until_active();
+            if !gate.is_active() {
+                was_near = watch_proximity(&app, was_near);
+                std::thread::sleep(Duration::from_millis(140));
+                continue;
+            }
+            was_near = false;
             let mut last = (f64::MIN, f64::MIN);
             let mut ticks: u32 = 0;
             while gate.is_active() {
@@ -336,13 +385,9 @@ pub fn spawn_cursor_poll(app: AppHandle, gate: Arc<PollGate>) {
                 // the mouse, which also makes the drop zone as forgiving as the Mac's.
                 // A press may be the start of a drag: make sure the drop target is
                 // ours before the file arrives.
+                // A file being dragged has to be able to find us: while a button is
+                // held anywhere over the panel, the whole panel takes the mouse.
                 let down = left_button_down();
-                if down && !was_down {
-                    let handle = app.clone();
-                    let _ = app.run_on_main_thread(move || unblock_webview_drops(&handle));
-                }
-                was_down = down;
-
                 let dragging = down
                     && x >= 0.0
                     && x <= size.0

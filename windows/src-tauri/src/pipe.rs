@@ -125,7 +125,7 @@ async fn handle(app: AppHandle, mut pipe: NamedPipeServer) {
         .unwrap_or_default()
         .to_string();
 
-    if event != "PermissionRequest" {
+    if event != "PermissionRequest" && event != "Question" {
         log::line(format!("hook {event}"));
         let _ = app.emit_to(WINDOW_LABEL, "hook", payload);
         let _ = pipe.disconnect();
@@ -224,4 +224,11 @@ pub fn answer(app: &AppHandle, request_id: &str, decision: &str) {
     };
     log::line(format!("decision id={request_id} {word}"));
     send(app, request_id, Reply::Decision(word.to_string()), false);
+}
+
+/// Called when the user clicks an answer in the island's question card. The
+/// label goes to OpenCode verbatim; `__dismiss__` rejects the question.
+pub fn question_answer(app: &AppHandle, request_id: &str, answer: &str) {
+    log::line(format!("question id={request_id} answer={answer}"));
+    send(app, request_id, Reply::Decision(answer.to_string()), false);
 }

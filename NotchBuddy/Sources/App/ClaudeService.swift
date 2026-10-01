@@ -387,9 +387,15 @@ final class ClaudeService {
         } else if ext == "webp" {
             return ["type": "image", "source": ["type": "base64", "media_type": "image/webp", "data": base64]]
         } else {
-            // Text/code — inline as text if <= 200 KB
-            guard data.count <= 200_000,
-                  let text = String(data: data, encoding: .utf8) else { return nil }
+            // Text/code — inline up to 1 MB, and say so when the file was cut.
+            let limit = 1_000_000
+            guard let handle = try? FileHandle(forReadingFrom: url) else { return nil }
+            defer { try? handle.close() }
+            guard let head = try? handle.read(upToCount: limit), !head.isEmpty,
+                  var text = String(data: head, encoding: .utf8) else { return nil }
+            if head.count == limit {
+                text += "\n… [truncated at \(limit) bytes; ask for a specific part if you need more]"
+            }
             return ["type": "text", "text": "File contents:\n\(text)"]
         }
     }

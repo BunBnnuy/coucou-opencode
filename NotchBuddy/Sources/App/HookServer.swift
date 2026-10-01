@@ -166,9 +166,15 @@ final class HookServer: @unchecked Sendable {
 
         let termProgram = payload["term_program"] as? String ?? ""
         let bundleId    = payload["bundle_id"]    as? String ?? ""
+        // OpenCode sessions are not VS Code, but they are wanted all the same.
+        let isOpenCode  = payload["source"] as? String == "opencode"
+        // T3 Code conversations, forwarded by the OpenCode plugin's watcher.
+        let isT3        = payload["source"] as? String == "t3"
+        let agentName   = resolvedAgentName(from: payload)
+        let agentModel  = (payload["model"] as? String) ?? (payload["to_model"] as? String)
         let isVSCode = termProgram.lowercased().contains("vscode") ||
                        bundleId.lowercased().contains("vscode")
-        guard isVSCode else {
+        guard isVSCode || isOpenCode || isT3 else {
             nbLog("Ignored \(name) from \(termProgram.isEmpty ? bundleId : termProgram) (\(projectName))")
             return
         }
@@ -179,14 +185,14 @@ final class HookServer: @unchecked Sendable {
 
         case "SessionStart":
             activeSessionId = sessionId
-            upsertTask(projectName: projectName, cwd: cwd)
+            upsertTask(projectName: projectName, cwd: cwd, agent: agentName, model: agentModel)
             nbLog("SessionStart \(projectName) (\(sessionId.prefix(8)))")
             if state.isPresent { expandIfNeeded(to: .overview) }
             SoundEngine.shared.play("work")
 
         case "UserPromptSubmit":
             activeSessionId = sessionId
-            upsertTask(projectName: projectName, cwd: cwd)
+            upsertTask(projectName: projectName, cwd: cwd, agent: agentName, model: agentModel)
             state.updateTask(id: "integration_claude", state: .thinking)
             if let prompt = payload["prompt"] as? String, !prompt.isEmpty {
                 appendStep(id: "integration_claude", step: String(prompt.prefix(60)))
@@ -195,7 +201,7 @@ final class HookServer: @unchecked Sendable {
 
         case "PreToolUse":
             activeSessionId = sessionId
-            upsertTask(projectName: projectName, cwd: cwd)
+            upsertTask(projectName: projectName, cwd: cwd, agent: agentName, model: agentModel)
             state.updateTask(id: "integration_claude", state: .working)
             let tool = payload["tool_name"] as? String ?? "Tool"
             let input = payload["tool_input"] as? [String: Any] ?? [:]
@@ -257,6 +263,43 @@ final class HookServer: @unchecked Sendable {
         case "SubagentStop":
             appendStep(id: "integration_claude", step: "• subagent done")
 
+        // An assistant reply (T3 Code conversations forwarded by the plugin).
+        case "AgentMessage":
+            upsertTask(projectName: projectName, cwd: cwd, agent: agentName, model: agentModel)
+            state.updateTask(id: "integration_claude", state: .working)
+            if let message = payload["message"] as? String {
+                let reply = message.split(whereSeparator: \.isWhitespace).joined(separator: " ")
+                if !reply.isEmpty { appendStep(id: "integration_claude", step: String(reply.prefix(90))) }
+            }
+
+        // The agent is asking something (OpenCode's question tool).
+        case "Question":
+            upsertTask(projectName: projectName, cwd: cwd, agent: agentName, model: agentModel)
+            state.pendingQuestion = PendingQuestion(
+                id: payload["request_id"] as? String ?? "",
+                text: payload["message"] as? String ?? "A question needs an answer.",
+                options: payload["question_options"] as? [String] ?? []
+            )
+            state.updateTask(id: "integration_claude", state: .question)
+            state.isPinned = true
+            state.focusId = "integration_claude"
+            SoundEngine.shared.play("approval")
+            NotificationCenter.default.post(name: .hookExpand, object: IslandView.question)
+
+        // Answered or rejected, here or in the terminal: drop the card.
+        case "QuestionEnd":
+            if let pending = state.pendingQuestion {
+                let id = payload["request_id"] as? String ?? ""
+                if id.isEmpty || pending.id.isEmpty || id == pending.id {
+                    state.pendingQuestion = nil
+                    state.isPinned = false
+                    state.updateTask(id: "integration_claude", state: .working)
+                    if state.view == .question {
+                        state.view = state.tasks.isEmpty ? .empty : .overview
+                    }
+                }
+            }
+
         default:
             break
         }
@@ -297,9 +340,13 @@ final class HookServer: @unchecked Sendable {
 
         let termProgram = payload["term_program"] as? String ?? ""
         let bundleId    = payload["bundle_id"]    as? String ?? ""
+        let isOpenCode  = payload["source"] as? String == "opencode"
+        let isT3        = payload["source"] as? String == "t3"
+        let agentName   = resolvedAgentName(from: payload)
+        let agentModel  = (payload["model"] as? String) ?? (payload["to_model"] as? String)
         let isVSCode = termProgram.lowercased().contains("vscode") ||
                        bundleId.lowercased().contains("vscode")
-        guard isVSCode else {
+        guard isVSCode || isOpenCode || isT3 else {
             Task.detached { [weak self] in
                 self?.sendLine(fd: fd, text: #"{"permissionDecision":"ask"}"#)
                 close(fd)
@@ -325,7 +372,7 @@ final class HookServer: @unchecked Sendable {
         pendingApprovalFD = fd
         activeSessionId = sessionId
 
-        upsertTask(projectName: projectName, cwd: cwd)
+        upsertTask(projectName: projectName, cwd: cwd, agent: agentName, model: agentModel)
         state.updateTask(id: "integration_claude", state: .approval)
         state.pendingApproval = ApprovalInfo(sessionId: sessionId, tool: tool, command: command)
         state.isPinned = true
@@ -374,14 +421,25 @@ final class HookServer: @unchecked Sendable {
 
     /// Updates integration_claude with the current session project name and cwd.
     @MainActor
-    private func upsertTask(projectName: String, cwd: String = "") {
-        let state = AppState.shared
+    private func upsertTask(projectName: String, cwd: String = "", agent: String? = nil, model: String? = nil) {        let state = AppState.shared
         guard let idx = state.tasks.firstIndex(where: { $0.id == "integration_claude" }) else { return }
         state.tasks[idx].name = projectName
         if !cwd.isEmpty { state.tasks[idx].sessionCwd = cwd }
+        // Which agent is driving (nil = Claude Code) and, when it says, the model.
+        state.tasks[idx].agentName = agent
+        state.tasks[idx].agentModel = model
     }
 
     // MARK: - Badge helpers
+
+    /// Which agent sent this event: the explicit `agent` first, then the OpenCode
+    /// plugin's `source` marker. nil means unknown — the UI shows a neutral "Agent".
+    /// (Claude Code's own `source` field is the session-start reason, never "opencode".)
+    private func resolvedAgentName(from payload: [String: Any]) -> String? {
+        if let name = payload["agent"] as? String, !name.isEmpty { return name }
+        if payload["source"] as? String == "opencode" { return "OpenCode" }
+        return nil
+    }
 
     @MainActor
     private func setPillBadge(id: String, badge: PillBadge) {
@@ -404,8 +462,10 @@ final class HookServer: @unchecked Sendable {
         guard let idx = state.tasks.firstIndex(where: { $0.id == "integration_claude" }) else { return }
         state.tasks[idx].steps = []
         state.tasks[idx].stepIndex = 0
-        state.tasks[idx].name = "VS Code"
+        state.tasks[idx].name = "Agent"
         state.tasks[idx].pillBadge = nil
+        state.tasks[idx].agentName = nil
+        state.tasks[idx].agentModel = nil
     }
 
     @MainActor
@@ -499,6 +559,46 @@ final class HookServer: @unchecked Sendable {
         #endif
     }
 
+    // MARK: - OpenCode plugin installation
+
+    /// Where OpenCode loads project-agnostic plugins from.
+    static var openCodePluginPath: String {
+        FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".config/opencode/plugins/coucou.ts").path
+    }
+
+    static func isOpenCodePluginInstalled() -> Bool {
+        FileManager.default.fileExists(atPath: openCodePluginPath)
+    }
+
+    /// The plugin is shared with the Windows app and ships inside the bundle
+    /// (Resources/opencode/coucou.ts).
+    private static func bundledOpenCodePlugin() -> String? {
+        guard let url = Bundle.main.url(forResource: "coucou", withExtension: "ts", subdirectory: "opencode") else {
+            return nil
+        }
+        return try? String(contentsOf: url, encoding: .utf8)
+    }
+
+    /// Writes the shared plugin into OpenCode's global plugin directory.
+    /// Only our own file is written — `opencode.json` is never opened or rewritten.
+    func installOpenCodePlugin() throws {
+        guard let source = Self.bundledOpenCodePlugin() else {
+            throw NSError(domain: "Coucou", code: 0, userInfo: [NSLocalizedDescriptionKey:
+                "The OpenCode plugin is missing from the app bundle."])
+        }
+        let url = URL(fileURLWithPath: Self.openCodePluginPath)
+        try FileManager.default.createDirectory(at: url.deletingLastPathComponent(),
+                                                withIntermediateDirectories: true)
+        try source.write(to: url, atomically: true, encoding: .utf8)
+    }
+
+    func uninstallOpenCodePlugin() throws {
+        let path = Self.openCodePluginPath
+        guard FileManager.default.fileExists(atPath: path) else { return }
+        try FileManager.default.removeItem(atPath: path)
+    }
+
     // MARK: - Outdated hook detection
 
     /// Returns true if settings.json has a Coucou PermissionRequest hook with timeout < 120s.
@@ -578,6 +678,8 @@ final class HookServer: @unchecked Sendable {
             ("Notification", 10),
             ("Stop", 10), ("StopFailure", 10),
             ("SubagentStart", 10), ("SubagentStop", 10),
+            // Follows the active model so the island can show it.
+            ("PostModelSwitch", 10),
         ]
         var hooks = settings["hooks"] as? [String: Any] ?? [:]
         for (event, timeout) in events {
@@ -683,6 +785,8 @@ final class HookServer: @unchecked Sendable {
             ("Notification", 10),
             ("Stop", 10), ("StopFailure", 10),
             ("SubagentStart", 10), ("SubagentStop", 10),
+            // Follows the active model so the island can show it.
+            ("PostModelSwitch", 10),
         ]
         var hooks = settings["hooks"] as? [String: Any] ?? [:]
         for (event, timeout) in events {
@@ -751,6 +855,11 @@ def main():
     payload.setdefault('bundle_id', env.get('__CFBundleIdentifier', ''))
     if 'cwd' not in payload or not payload['cwd']:
         payload['cwd'] = os.getcwd()
+
+    # This relay serves Claude Code; name the agent for the island. Never over an
+    # OpenCode payload (the old plugin only sends `source`).
+    if payload.get('agent') is None and payload.get('source') != 'opencode':
+        payload['agent'] = 'Claude Code'
 
     event = payload.get('hook_event_name', '')
     socket_path = os.path.expanduser(
@@ -842,6 +951,11 @@ def main():
     payload.setdefault('bundle_id', env.get('__CFBundleIdentifier', ''))
     if 'cwd' not in payload or not payload['cwd']:
         payload['cwd'] = os.getcwd()
+
+    # This relay serves Claude Code; name the agent for the island. Never over an
+    # OpenCode payload (the old plugin only sends `source`).
+    if payload.get('agent') is None and payload.get('source') != 'opencode':
+        payload['agent'] = 'Claude Code'
 
     event = payload.get('hook_event_name', '')
     socket_path = os.path.expanduser(

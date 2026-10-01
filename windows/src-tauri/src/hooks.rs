@@ -33,6 +33,8 @@ pub const HOOK_EVENTS: &[(&str, u64)] = &[
     ("StopFailure", 10),
     ("SubagentStart", 10),
     ("SubagentStop", 10),
+    // Follows the active model so the island can show it.
+    ("PostModelSwitch", 10),
 ];
 
 /// Marker that identifies a Coucou entry inside settings.json.
@@ -350,11 +352,19 @@ pub fn ensure_hook_exe(app: &AppHandle) {
     if same {
         return;
     }
-    // A hook may be running right now and hold the file open; keeping the old
-    // copy is fine, it is the same relay.
-    if let Err(err) = std::fs::copy(&src, &dest) {
-        if !dest.exists() {
-            crate::log::line(format!("could not install coucou-hook.exe: {err}"));
+    // A hook may be running right now and hold the file open. Hook processes are
+    // short-lived, so retry briefly instead of leaving a stale relay in place —
+    // a stale relay is not the same relay once its payload handling changes.
+    for attempt in 0..6 {
+        match std::fs::copy(&src, &dest) {
+            Ok(_) => return,
+            Err(err) => {
+                if attempt == 5 {
+                    crate::log::line(format!("could not install coucou-hook.exe: {err}"));
+                } else {
+                    std::thread::sleep(std::time::Duration::from_millis(300));
+                }
+            }
         }
     }
 }

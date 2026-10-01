@@ -5,7 +5,7 @@
 import { h, svg, clear, dot } from "./dom";
 import { ICONS } from "./icons";
 import { Ticker } from "./ticker";
-import { State, type AgentTask } from "../core/state";
+import { State, agentDetail, agentLabel, type AgentTask, type T3Thread } from "../core/state";
 import { washRGBA, type IslandViewName, type Wash } from "../core/layout";
 import { createMiniBot, pruneMiniBots } from "../mochi/minibots";
 import { buildPrompt } from "./chat";
@@ -21,6 +21,10 @@ export interface ViewActions {
   openTarget(): void;
   openUrl(url: string): void;
   decide(d: "allow" | "deny"): void;
+  /** The user clicked an answer in the question card. */
+  answerQuestion(label: string): void;
+  /** The user picked a T3 Code conversation to continue. */
+  openThread(thread: T3Thread): void;
   toggleSound(): void;
   setVolume(v: number): void;
   setAutoClose(seconds: number): void;
@@ -80,6 +84,7 @@ function stack(padLeft: number, padRight: number, ...children: Node[]): HTMLElem
 export function buildHeader(actions: ViewActions): ViewHost {
   const tabHome = h("button", { class: "tab", title: "Overview", onclick: () => go("overview") }, svg(ICONS.house, 13));
   const tabChat = h("button", { class: "tab", title: "Ask", onclick: () => go("prompt") }, svg(ICONS.bubble, 13));
+  const tabThreads = h("button", { class: "tab", title: "T3 conversations", onclick: () => go("threads") }, svg(ICONS.list, 13));
   const tabDrop = h("button", { class: "tab", title: "Drop", onclick: () => go("upload") }, svg(ICONS.plus, 13));
 
   const gearBtn = h("button", { title: "Settings", onclick: () => go("settings") }, svg(ICONS.gear, 14));
@@ -93,7 +98,7 @@ export function buildHeader(actions: ViewActions): ViewHost {
   const el = h(
     "div",
     { id: "header" },
-    h("div", { class: "tabs" }, tabHome, tabChat, tabDrop),
+    h("div", { class: "tabs" }, tabHome, tabChat, tabThreads, tabDrop),
     h("div", { class: "header-actions" }, gearBtn, soundBtn),
   );
 
@@ -103,6 +108,7 @@ export function buildHeader(actions: ViewActions): ViewHost {
       const v = State.view;
       tabHome.classList.toggle("on", v === "overview" || v === "empty");
       tabChat.classList.toggle("on", v === "prompt");
+      tabThreads.classList.toggle("on", v === "threads");
       tabDrop.classList.toggle("on", v === "upload");
       gearBtn.classList.toggle("on", v === "settings");
       clear(gearBtn);
@@ -164,6 +170,9 @@ function buildOverview(actions: ViewActions): ViewHost {
       if (mode === "ticker") ticker.tick(nowMs);
     },
     sync() {
+      // With no other pills there is no right card to show: the main agent
+      // takes the whole window (CSS .overview.solo).
+      el.classList.toggle("solo", State.otherTasks.length === 0);
       const task = State.focusTask;
       if (task?.id !== lastFocus) {
         lastFocus = task?.id ?? null;
@@ -188,7 +197,7 @@ function buildOverview(actions: ViewActions): ViewHost {
         who.append(
           dot(task.color, 7),
           h("span", { class: "name", text: task.name }),
-          h("span", { class: "tool", text: task.source === "claudeCode" ? "Claude Code" : "n8n" }),
+          h("span", { class: "tool", text: task.source === "claudeCode" ? agentDetail(task) : "n8n" }),
         );
         if (task.steps.length > 1) {
           who.append(h("span", {
@@ -227,7 +236,7 @@ function buildOverview(actions: ViewActions): ViewHost {
 }
 
 function buildPill(task: AgentTask, actions: ViewActions): HTMLElement {
-  const label = task.id === "integration_claude" ? "VS Code" : task.name;
+  const label = task.name;
   const canvas = createMiniBot(task, 24);
   const pill = h(
     "div",
@@ -319,20 +328,92 @@ function buildApproval(actions: ViewActions): ViewHost {
 
 // ── Question ──────────────────────────────────────────────────────────────────
 
-function buildQuestion(): ViewHost {
+function buildQuestion(actions: ViewActions): ViewHost {
   const who = h("div");
   const title = h("div", { class: "title" });
+  const list = h("div", { class: "q-list" });
   const row = h("div", { class: "actions" });
-  const el = h("div", { class: "view" }, card("cyan", stack(116, 16, who, title, row)));
+  const el = h("div", { class: "view" }, card("cyan", stack(116, 16, who, title, list, row)));
   return {
     el,
     sync() {
       clear(who);
-      who.append(agentWho(State.focusTask, "Claude Code is asking a question"));
-      const task = State.focusTask;
-      title.textContent = task?.steps.at(-1) ?? "Claude needs an answer.";
+      who.append(agentWho(State.focusTask, `${agentLabel(State.focusTask)} is asking a question`));
+      const question = State.pendingQuestion;
+      title.textContent = question?.text ?? "The agent needs an answer.";
+      clear(list);
+      for (const option of question?.options ?? []) {
+        const item = h(
+          "button",
+          { class: "q-option" },
+          h("span", { class: "q-label", text: option.label }),
+          option.description ? h("span", { class: "q-desc", text: option.description }) : null,
+        );
+        item.addEventListener("click", () => actions.answerQuestion(option.label));
+        list.append(item);
+      }
       clear(row);
-      row.append(h("div", { class: "sub", text: "Answer in your terminal — Coucou can't reply for you yet." }));
+      if (question) {
+        const dismiss = h("button", { class: "q-dismiss", text: "Dismiss" });
+        dismiss.addEventListener("click", () => actions.answerQuestion("__dismiss__"));
+        row.append(dismiss);
+      }
+      row.append(h("div", { class: "sub", text: "Answer here, or in T3 Code." }));
+    },
+  };
+}
+
+// ── T3 conversations ──────────────────────────────────────────────────────────
+
+function timeAgo(iso: string): string {
+  const t = Date.parse(iso);
+  if (!Number.isFinite(t)) return "";
+  const seconds = Math.max(0, (Date.now() - t) / 1000);
+  if (seconds < 60) return "now";
+  if (seconds < 3600) return `${Math.floor(seconds / 60)}m`;
+  if (seconds < 86400) return `${Math.floor(seconds / 3600)}h`;
+  return `${Math.floor(seconds / 86400)}d`;
+}
+
+function lastPath(p: string): string {
+  const clean = p.replace(/[\\/]+$/, "");
+  const index = Math.max(clean.lastIndexOf("\\"), clean.lastIndexOf("/"));
+  return index >= 0 ? clean.slice(index + 1) : clean;
+}
+
+function buildThreads(actions: ViewActions): ViewHost {
+  const title = h("div", { class: "title", text: "T3 conversations" });
+  const list = h("div", { class: "thread-list" });
+  const hint = h("div", { class: "sub", text: "Pick one to bring T3 Code forward." });
+  const el = h("div", { class: "view" }, card(null, stack(116, 16, title, list, hint)));
+  return {
+    el,
+    sync() {
+      const count = Math.max(1, Math.min(30, State.settings.recentThreads || 10));
+      const threads = State.t3Threads.slice(0, count);
+      clear(list);
+      hint.style.display = threads.length === 0 ? "none" : "";
+      if (threads.length === 0) {
+        list.append(
+          h("div", { class: "sub", text: "No conversations yet — they appear here as you use T3 Code." }),
+        );
+        return;
+      }
+      for (const thread of threads) {
+        const where = thread.project || lastPath(thread.cwd) || "T3 Code";
+        const preview = thread.lastMessage
+          ? `${thread.lastRole === "user" ? "You: " : ""}${thread.lastMessage}`
+          : `${where} · ${timeAgo(thread.updatedAt)}`;
+        const row = h(
+          "button",
+          { class: "q-option thread-option", title: thread.title },
+          h("span", { class: "q-label", text: thread.title || "Untitled" }),
+          h("span", { class: "q-desc", text: `${where} · ${timeAgo(thread.updatedAt)}` }),
+          h("span", { class: "q-preview", text: preview }),
+        );
+        row.addEventListener("click", () => actions.openThread(thread));
+        list.append(row);
+      }
     },
   };
 }
@@ -353,7 +434,7 @@ function buildError(actions: ViewActions): ViewHost {
     sync() {
       const task = State.focusTask;
       clear(who);
-      who.append(agentWho(task, task?.source === "n8n" ? "n8n" : "Claude Code"));
+      who.append(agentWho(task, task?.source === "n8n" ? "n8n" : agentLabel(task)));
       title.textContent = task?.source === "n8n" ? "Workflow stopped." : "Session stopped on an error.";
       detail.textContent = task?.steps.at(-1) ?? "No detail available.";
     },
@@ -374,7 +455,7 @@ function buildFinished(actions: ViewActions): ViewHost {
     el,
     sync() {
       clear(who);
-      who.append(agentWho(State.focusTask, "Claude Code finished"));
+      who.append(agentWho(State.focusTask, `${agentLabel(State.focusTask)} finished`));
       title.textContent = State.focusTask?.steps.at(-1) ?? "Session finished";
     },
   };
@@ -439,7 +520,7 @@ function buildSettings(actions: ViewActions): ViewHost {
       h("div", { class: "grow" }),
       h("button", {
         class: "link-btn",
-        style: "color:#8e939c;font-size:11.5px",
+        style: "color:var(--dim-2);font-size:11.5px",
         text: "Settings…",
         onclick: () => actions.openSettingsWindow(),
       }),
@@ -461,7 +542,7 @@ function buildSettings(actions: ViewActions): ViewHost {
       clear(claudeBadge);
       claudeBadge.append(
         dot(s.hooksInstalled ? "#22C55E" : "#F4505E", 6),
-        h("span", { text: "Claude Code" }),
+        h("span", { text: "Hooks" }),
       );
       clear(apiBadge);
       apiBadge.append(dot("#F4505E", 6), h("span", { text: "API" }));
@@ -491,7 +572,8 @@ export function buildViews(
   map.set("overview", buildOverview(actions));
   map.set("empty", buildEmpty(actions));
   map.set("approval", buildApproval(actions));
-  map.set("question", buildQuestion());
+  map.set("question", buildQuestion(actions));
+  map.set("threads", buildThreads(actions));
   map.set("error", buildError(actions));
   map.set("finished", buildFinished(actions));
   map.set("confused", buildConfused());

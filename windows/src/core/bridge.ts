@@ -48,6 +48,12 @@ export const Bridge = {
 
   reposition: () => call<void>("reposition"),
 
+  /** Move the island window by a logical delta while dragging it. */
+  moveIslandBy: (dx: number, dy: number) => call<void>("move_island_by", { dx, dy }),
+
+  /** Snap the island to the nearest edge and remember where it was left. */
+  snapIsland: () => call<void>("snap_island"),
+
   openUrl: (url: string) => call<void>("open_url", { url }),
 
   /** "Open terminal" → opens the folder in VS Code when `code` is on PATH. */
@@ -71,8 +77,22 @@ export const Bridge = {
   hooksApply: (install: boolean, fingerprint: string) =>
     callOrThrow<string>("hooks_apply", { install, fingerprint }),
 
+  // ── OpenCode plugin ───────────────────────────────────────────────────────
+  /** Whether Coucou's plugin is in %USERPROFILE%\.config\opencode\plugins. */
+  openCodeStatus: () => call<boolean>("opencode_status"),
+  /** Writes the shared plugin; returns the path it landed at. */
+  openCodeInstall: () => callOrThrow<string>("opencode_install"),
+  openCodeUninstall: () => callOrThrow<void>("opencode_uninstall"),
+
   approvalDecision: (requestId: string, decision: "allow" | "deny") =>
     call<void>("approval_decision", { requestId, decision }),
+  /** An answer clicked in the question card; the label goes to OpenCode as-is. */
+  questionAnswer: (requestId: string, answer: string) =>
+    call<void>("question_answer", { requestId, answer }),
+
+  /** Bring T3 Code forward so the picked conversation can be continued. */
+  openT3Thread: (threadId: string) => call<void>("open_t3_thread", { threadId }),
+
   /** "The card is up" — until this lands the relay only waits a moment. */
   approvalAck: (requestId: string) => call<void>("approval_ack", { requestId }),
   /** "Nobody can act on this" — Claude Code asks in the terminal right away. */
@@ -85,6 +105,9 @@ export const Bridge = {
   chatReset: () => call<void>("chat_reset"),
   /** Copies a dropped file into the inbox. */
   ingestFile: (path: string) => callOrThrow<DroppedFile>("ingest_file", { path }),
+  /** HTML5 drops give the page bytes, not a path; base64 keeps the IPC simple. */
+  ingestFileBase64: (name: string, data: string) =>
+    callOrThrow<DroppedFile>("ingest_file_base64", { name, data }),
   /** Only ever tells you whether a key exists — never its value. */
   secretPresent: (key: string) => call<boolean>("secret_present", { key }),
   secretSet: (key: string, value: string) => callOrThrow<void>("secret_set", { key, value }),

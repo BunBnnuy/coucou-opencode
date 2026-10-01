@@ -19,6 +19,21 @@ export interface AgentTask {
   miniEye?: EyeShape | null;
   pillBadge?: PillBadge | null;
   sessionCwd?: string | null;
+  /** "OpenCode", … — null/undefined means Claude Code. */
+  agentName?: string | null;
+  /** Model id, when the agent told us one. */
+  agentModel?: string | null;
+}
+
+/** What the island calls the agent driving this task. */
+export function agentLabel(task: AgentTask | null | undefined): string {
+  return task?.agentName ?? "Agent";
+}
+
+/** Agent plus model, when the model is known — shown in the ticker header. */
+export function agentDetail(task: AgentTask | null | undefined): string {
+  const label = agentLabel(task);
+  return task?.agentModel ? `${label} · ${task.agentModel}` : label;
 }
 
 export interface ApprovalInfo {
@@ -26,6 +41,32 @@ export interface ApprovalInfo {
   sessionId: string;
   tool: string;
   command: string;
+}
+
+/** A question the agent is waiting on (OpenCode's question tool). */
+export interface QuestionOption {
+  label: string;
+  description: string;
+}
+
+export interface PendingQuestion {
+  id: string;
+  text: string;
+  options: QuestionOption[];
+}
+
+/** A T3 Code conversation, shown in the threads tab. */
+export interface T3Thread {
+  id: string;
+  title: string;
+  project: string;
+  cwd: string;
+  updatedAt: string;
+  provider: string;
+  /** "user" | "assistant" — who sent the last message. */
+  lastRole: string;
+  /** The agent's (or the user's) last message, as a preview. */
+  lastMessage: string;
 }
 
 export interface ChatMessage {
@@ -58,7 +99,7 @@ const task = (
 
 /** AgentTask.integrationAgents — same ids, names and colours as macOS. */
 export const INTEGRATION_AGENTS: AgentTask[] = [
-  task("integration_claude", "VS Code", "#F5F6F8", "claudeCode"),
+  task("integration_claude", "Agent", "#F5F6F8", "claudeCode"),
   task("integration_resend", "Resend", "#22C55E", "n8n"),
   task("integration_n8n", "n8n", "#F29B38", "n8n"),
   task("integration_vercel", "Vercel", "#7C5CFF", "n8n"),
@@ -92,6 +133,20 @@ export interface Settings {
   hooksInstalled: boolean;
   /** Claude model used by the chat. */
   model: string;
+  /** "anthropic" (Claude API) or "opencode" (OpenCode Go / Zen). */
+  chatProvider: string;
+  /** Model used when chatProvider is "opencode". */
+  opencodeModel: string;
+  /** Where the island is attached: "top" or "bottom" (above the taskbar). */
+  islandAnchor: string;
+  /** Horizontal centre as a fraction of the monitor width (0.0–1.0). */
+  islandOffsetX: number;
+  /** Island theme: "dark", "light", or "system" (follow Windows). */
+  theme: string;
+  /** Base colour of the main Mochi blob (hex). */
+  mochiColor: string;
+  /** How many T3 Code threads the threads tab lists (1–30). */
+  recentThreads: number;
 }
 
 export const DEFAULT_SETTINGS: Settings = {
@@ -106,6 +161,13 @@ export const DEFAULT_SETTINGS: Settings = {
   autostart: false,
   hooksInstalled: false,
   model: "claude-opus-5",
+  chatProvider: "anthropic",
+  opencodeModel: "deepseek-v4.1-flash",
+  islandAnchor: "top",
+  islandOffsetX: 0.5,
+  theme: "dark",
+  mochiColor: "#C4C5CA",
+  recentThreads: 10,
 };
 
 type Listener = () => void;
@@ -137,6 +199,13 @@ class AppState {
   searchResult: SearchResult | null = null;
   chatHistory: ChatMessage[] = [];
   pendingApproval: ApprovalInfo | null = null;
+  pendingQuestion: PendingQuestion | null = null;
+  /** Recent T3 Code conversations, pushed by the OpenCode plugin. */
+  t3Threads: T3Thread[] = [];
+  /** Transient step shown in the compact pill while work happens. */
+  compactLine: string | null = null;
+  /** When the compact line was set; the frame loop clears it after a while. */
+  compactLineAt = 0;
 
   integrations: Record<string, IntegrationInfo> = {};
 
@@ -229,6 +298,9 @@ class AppState {
   }
 
   defaultView(): IslandViewName {
+    // A pending approval or question owns the island until it is answered.
+    if (this.pendingApproval) return "approval";
+    if (this.pendingQuestion) return "question";
     return this.tasks.length === 0 ? "empty" : "overview";
   }
 }

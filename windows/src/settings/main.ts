@@ -5,6 +5,7 @@
 import "./settings.css";
 import { Bridge, onEvent, type HookStatus } from "../core/bridge";
 import { DEFAULT_SETTINGS, type Settings } from "../core/state";
+import { applyThemeClass, DEFAULT_MOCHI, setMochiColor, systemPrefersLight } from "../core/theme";
 import { h, clear } from "../views/dom";
 
 let settings: Settings = { ...DEFAULT_SETTINGS };
@@ -171,87 +172,199 @@ function claudeSection(status: HookStatus): HTMLElement {
   return section;
 }
 
-// ── Claude API section ────────────────────────────────────────────────────────
+// ── OpenCode section ──────────────────────────────────────────────────────────
 
-const MODELS: [string, string][] = [
+function openCodeSection(installed: boolean): HTMLElement {
+  let on = installed;
+  const dot = statusDot(on);
+  const note = h("div", { class: "hint" });
+  const actions = h("div", { class: "row" });
+  const feedback = h("div", {});
+  const pathLine = h("span", {
+    class: "path",
+    text: "%USERPROFILE%\\.config\\opencode\\plugins\\coucou.ts",
+  });
+
+  function refresh() {
+    dot.style.background = on ? "#22c55e" : "#f4505e";
+    note.textContent = on
+      ? "OpenCode sessions show up in the island too, and you can approve their permission requests from the notch. Restart OpenCode after a change."
+      : "Install the plugin to watch your OpenCode sessions in the island and approve permissions from the notch.";
+    clear(actions);
+    clear(feedback);
+
+    const install = h("button", {
+      class: "primary",
+      text: on ? "Reinstall plugin" : "Install plugin",
+    });
+    install.addEventListener("click", async () => {
+      install.disabled = true;
+      try {
+        const where = await Bridge.openCodeInstall();
+        on = true;
+        refresh();
+        feedback.append(h("div", { class: "notice ok", text: `Installed at ${where}. Restart OpenCode to pick it up.` }));
+      } catch (err) {
+        install.disabled = false;
+        feedback.append(h("div", { class: "notice err", text: `Could not write: ${String(err)}` }));
+      }
+    });
+    actions.append(install);
+
+    if (on) {
+      const remove = h("button", { class: "danger", text: "Uninstall plugin" });
+      remove.addEventListener("click", async () => {
+        remove.disabled = true;
+        try {
+          await Bridge.openCodeUninstall();
+          on = false;
+          refresh();
+          feedback.append(h("div", { class: "notice ok", text: "Plugin removed." }));
+        } catch (err) {
+          remove.disabled = false;
+          feedback.append(h("div", { class: "notice err", text: `Could not remove: ${String(err)}` }));
+        }
+      });
+      actions.append(remove);
+    }
+  }
+
+  refresh();
+  return h(
+    "section",
+    {},
+    h("h2", {}, dot, h("span", { text: "OpenCode" })),
+    note,
+    h("div", { class: "row" }, h("label", { text: "Plugin" }), pathLine),
+    actions,
+    feedback,
+  );
+}
+
+// ── Chat section ──────────────────────────────────────────────────────────────
+
+const ANTHROPIC_MODELS: [string, string][] = [
   ["claude-opus-5", "Claude Opus 5"],
   ["claude-sonnet-5", "Claude Sonnet 5"],
   ["claude-haiku-4-5", "Claude Haiku 4.5"],
 ];
 
-function apiSection(hasKey: boolean): HTMLElement {
-  const dot = statusDot(hasKey);
-  const state = h("span", { class: "hint", text: hasKey ? "Key saved in the Windows Credential Manager." : "No key yet — the chat needs one." });
+/** OpenCode Go / Zen models that suit a quick chat. */
+const OPENCODE_MODELS: [string, string][] = [
+  ["deepseek-v4.1-flash", "DeepSeek V4.1 Flash"],
+  ["deepseek-v4-flash", "DeepSeek V4 Flash"],
+  ["deepseek-v4-pro", "DeepSeek V4 Pro"],
+  ["glm-5.3-flash", "GLM 5.3 Flash"],
+  ["kimi-k2.7-code", "Kimi K2.7 Code"],
+  ["minimax-m3", "MiniMax M3"],
+  ["qwen3.8-flash", "Qwen3.8 Flash"],
+  ["grok-4.6", "Grok 4.6"],
+];
 
-  const field = h("input", {
-    type: "password",
-    placeholder: hasKey ? "••••••••••••  (stored)" : "sk-ant-...",
-    style: "flex:1 1 auto;min-width:0",
-    autocomplete: "off",
-    spellcheck: "false",
-  }) as HTMLInputElement;
-
-  const saveBtn = h("button", { class: "primary", text: "Save key" });
-  const clearBtn = h("button", { class: "danger", text: "Remove" });
-  const feedback = h("div", {});
-
-  async function refresh() {
-    const present = (await Bridge.secretPresent("anthropic-api-key")) ?? false;
-    dot.style.background = present ? "#22c55e" : "#f4505e";
-    state.textContent = present
-      ? "Key saved in the Windows Credential Manager."
-      : "No key yet — the chat needs one.";
-    field.placeholder = present ? "••••••••••••  (stored)" : "sk-ant-...";
-    clearBtn.style.display = present ? "" : "none";
+function modelSelect(models: [string, string][], current: string, onChange: (id: string) => void): HTMLSelectElement {
+  const select = h("select", {}) as HTMLSelectElement;
+  for (const [id, label] of models) select.append(h("option", { value: id, text: label }));
+  if (!models.some(([id]) => id === current)) {
+    select.append(h("option", { value: current, text: current }));
   }
+  select.value = current;
+  select.addEventListener("change", () => onChange(select.value));
+  return select;
+}
 
-  saveBtn.addEventListener("click", async () => {
-    const value = field.value.trim();
-    if (!value) return;
-    clear(feedback);
-    try {
-      await Bridge.secretSet("anthropic-api-key", value);
-      field.value = "";
-      feedback.append(h("div", { class: "notice ok", text: "Saved. It never touches disk." }));
-      await refresh();
-    } catch (err) {
-      feedback.append(h("div", { class: "notice err", text: `Could not save: ${String(err)}` }));
-    }
+function apiSection(): HTMLElement {
+  const body = h("div", { style: "display:flex;flex-direction:column;gap:10px" });
+  const section = h("section", {}, h("h2", {}, h("span", { text: "Chat" })), body);
+
+  const provider = h("select", {}) as HTMLSelectElement;
+  provider.append(
+    h("option", { value: "anthropic", text: "Anthropic — Claude API" }),
+    h("option", { value: "opencode", text: "OpenCode — Go / Zen" }),
+  );
+  provider.value = settings.chatProvider === "opencode" ? "opencode" : "anthropic";
+  provider.addEventListener("change", () => {
+    settings.chatProvider = provider.value;
+    void save();
+    draw();
   });
 
-  clearBtn.addEventListener("click", async () => {
-    clear(feedback);
-    try {
-      await Bridge.secretClear("anthropic-api-key");
-      feedback.append(h("div", { class: "notice ok", text: "Key removed." }));
-      await refresh();
-    } catch (err) {
-      feedback.append(h("div", { class: "notice err", text: `Could not remove: ${String(err)}` }));
-    }
-  });
+  /** A key row that only ever reports whether the key exists. */
+  function keyRow(key: string, placeholder: string) {
+    const dot = statusDot(false);
+    const field = h("input", {
+      type: "password",
+      placeholder,
+      style: "flex:1 1 auto;min-width:0",
+      autocomplete: "off",
+      spellcheck: "false",
+    }) as HTMLInputElement;
+    const saveBtn = h("button", { class: "primary", text: "Save key" });
+    const clearBtn = h("button", { class: "danger", text: "Remove" });
+    const row = h("div", { class: "row" }, h("label", { text: "API key" }), field, saveBtn, clearBtn, dot);
 
-  const model = h("select", {}) as HTMLSelectElement;
-  for (const [id, label] of MODELS) model.append(h("option", { value: id, text: label }));
-  if (!MODELS.some(([id]) => id === settings.model)) {
-    model.append(h("option", { value: settings.model, text: settings.model }));
+    async function refresh() {
+      const present = (await Bridge.secretPresent(key)) ?? false;
+      dot.style.background = present ? "#22c55e" : "#f4505e";
+      field.placeholder = present ? "••••••••  (stored)" : placeholder;
+      clearBtn.style.display = present ? "" : "none";
+    }
+    saveBtn.addEventListener("click", async () => {
+      const value = field.value.trim();
+      if (!value) return;
+      try {
+        await Bridge.secretSet(key, value);
+        field.value = "";
+        await refresh();
+      } catch (err) {
+        dot.style.background = "#f5a524";
+        console.error(String(err));
+      }
+    });
+    clearBtn.addEventListener("click", async () => {
+      try {
+        await Bridge.secretClear(key);
+        await refresh();
+      } catch (err) {
+        console.error(String(err));
+      }
+    });
+    return { row, refresh };
   }
-  model.value = settings.model;
-  model.addEventListener("change", () => {
-    settings.model = model.value;
+
+  const anthropicKey = keyRow("anthropic-api-key", "sk-ant-...");
+  const opencodeKey = keyRow("opencode-api-key", "oc_sk_...");
+
+  const anthropicModel = modelSelect(ANTHROPIC_MODELS, settings.model, (id) => {
+    settings.model = id;
+    void save();
+  });
+  const opencodeModel = modelSelect(OPENCODE_MODELS, settings.opencodeModel || "deepseek-v4.1-flash", (id) => {
+    settings.opencodeModel = id;
     void save();
   });
 
-  clearBtn.style.display = hasKey ? "" : "none";
+  function draw() {
+    clear(body);
+    body.append(h("div", { class: "row" }, h("label", { text: "Provider" }), provider));
+    if (settings.chatProvider === "opencode") {
+      body.append(
+        opencodeKey.row,
+        h("div", { class: "row" }, h("label", { text: "Model" }), opencodeModel),
+        h("div", { class: "hint", text: "OpenCode Go / Zen key (oc_sk_…). It never touches disk." }),
+      );
+    } else {
+      body.append(
+        anthropicKey.row,
+        h("div", { class: "row" }, h("label", { text: "Model" }), anthropicModel),
+        h("div", { class: "hint", text: "Anthropic API key (sk-ant-…). It never touches disk." }),
+      );
+    }
+  }
 
-  return h(
-    "section",
-    {},
-    h("h2", {}, dot, h("span", { text: "Claude" })),
-    state,
-    h("div", { class: "row" }, h("label", { text: "API key" }), field, saveBtn, clearBtn),
-    h("div", { class: "row" }, h("label", { text: "Model" }), model),
-    feedback,
-  );
+  draw();
+  void anthropicKey.refresh();
+  void opencodeKey.refresh();
+  return section;
 }
 
 // ── Integrations section ──────────────────────────────────────────────────────
@@ -392,6 +505,65 @@ function generalSection(): HTMLElement {
     void save();
   });
 
+  const anchor = h("select", {}) as HTMLSelectElement;
+  anchor.append(
+    h("option", { value: "top", text: "Top edge" }),
+    h("option", { value: "bottom", text: "Bottom edge (above the taskbar)" }),
+  );
+  anchor.value = settings.islandAnchor === "bottom" ? "bottom" : "top";
+  anchor.addEventListener("change", () => {
+    settings.islandAnchor = anchor.value;
+    void save();
+  });
+
+  const centre = h("button", { text: "Center" });
+  centre.addEventListener("click", () => {
+    settings.islandOffsetX = 0.5;
+    void save();
+  });
+
+  const theme = h("select", {}) as HTMLSelectElement;
+  theme.append(
+    h("option", { value: "dark", text: "Dark" }),
+    h("option", { value: "light", text: "Light" }),
+    h("option", { value: "system", text: "Follow Windows" }),
+  );
+  theme.value = settings.theme === "light" || settings.theme === "system" ? settings.theme : "dark";
+  theme.addEventListener("change", () => {
+    settings.theme = theme.value;
+    applyThemeClass(settings.theme, systemPrefersLight());
+    void save();
+  });
+
+  const mochiColor = h("input", {
+    type: "color",
+    value: settings.mochiColor || DEFAULT_MOCHI,
+    style: "width:38px;height:24px;padding:0;border:0;border-radius:6px;background:transparent",
+  }) as HTMLInputElement;
+  mochiColor.addEventListener("input", () => {
+    settings.mochiColor = mochiColor.value.toUpperCase();
+    setMochiColor(settings.mochiColor);
+    void save();
+  });
+  const mochiDefault = h("button", { text: "Default" });
+  mochiDefault.addEventListener("click", () => {
+    settings.mochiColor = DEFAULT_MOCHI;
+    mochiColor.value = DEFAULT_MOCHI;
+    setMochiColor(DEFAULT_MOCHI);
+    void save();
+  });
+
+  const recent = h("input", {
+    type: "number", min: "1", max: "30", step: "1",
+    value: String(settings.recentThreads ?? 10),
+    style: "width:70px",
+  }) as HTMLInputElement;
+  recent.addEventListener("change", () => {
+    settings.recentThreads = Math.max(1, Math.min(30, Number(recent.value) || 10));
+    recent.value = String(settings.recentThreads);
+    void save();
+  });
+
   return h(
     "section",
     {},
@@ -411,6 +583,26 @@ function generalSection(): HTMLElement {
       screen,
     ),
     h("div", { class: "row" },
+      h("label", { text: "Island edge" }),
+      anchor,
+      centre,
+    ),
+    h("div", { class: "row" },
+      h("label", { text: "Theme" }),
+      theme,
+    ),
+    h("div", { class: "row" },
+      h("label", { text: "Mochi colour" }),
+      mochiColor,
+      mochiDefault,
+    ),
+    h("div", { class: "row" },
+      h("label", { text: "T3 threads" }),
+      recent,
+      h("span", { class: "hint", text: "shown in the threads tab" }),
+    ),
+    h("div", { class: "hint", text: "Drag the island itself to move it — it snaps to the top or bottom edge and remembers where you left it." }),
+    h("div", { class: "row" },
       h("label", { text: "Launch at startup" }),
       toggle(settings.autostart, (v) => { settings.autostart = v; void save(); }),
     ),
@@ -425,11 +617,15 @@ async function main() {
     settings = { ...settings, ...boot.settings };
     version = boot.version;
   }
+  applyThemeClass(settings.theme ?? "dark", systemPrefersLight());
+  window.matchMedia("(prefers-color-scheme: light)").addEventListener("change", () => {
+    if (settings.theme === "system") applyThemeClass("system", systemPrefersLight());
+  });
   const status = (await Bridge.hooksStatus()) ?? {
     installed: false, settingsPath: "", hookPath: "", hookReady: false,
   };
 
-  const hasKey = (await Bridge.secretPresent("anthropic-api-key")) ?? false;
+  const openCodeInstalled = (await Bridge.openCodeStatus()) ?? false;
 
   const keys = [
     "stripe-api-key", "github-token", "vercel-token",
@@ -442,7 +638,8 @@ async function main() {
   root.append(
     h("h1", {}, h("span", { text: "Coucou" }), h("span", { class: "version", text: version })),
     claudeSection(status),
-    apiSection(hasKey),
+    openCodeSection(openCodeInstalled),
+    apiSection(),
     integrationsSection(present),
     generalSection(),
     h("div", {
@@ -453,6 +650,7 @@ async function main() {
 
   void onEvent<Settings>("settings-changed", (s) => {
     settings = { ...settings, ...s };
+    applyThemeClass(settings.theme ?? "dark", systemPrefersLight());
   });
 }
 

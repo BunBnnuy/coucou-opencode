@@ -40,6 +40,7 @@ installs for the current user only — no admin prompt.
 | What you do | What happens |
 |---|---|
 | Move the mouse to the very top-centre of the screen | Mochi peeks out |
+| Drag the island (once open) | Moves it — it snaps to the top or bottom edge and remembers where you left it |
 | Click the small island | It opens |
 | Click Mochi | It gets annoyed. Three times in a row and it goes dizzy |
 | Rest the pointer on Mochi for two seconds | Hearts |
@@ -139,7 +140,8 @@ problems. It stays on your machine.
 ## What's different from the Mac version
 
 - No notch, so the island lives at the top centre of the screen and retracts into
-  the top edge instead of hiding in a notch.
+  the top edge instead of hiding in a notch — and you can drag it to any spot
+  along the top or bottom edge, where it snaps and stays.
 - Permission approval works from **any** terminal; the Mac build only listens to
   VS Code sessions.
 - Not in this version: sending a file by email, dragging Mochi onto a window to

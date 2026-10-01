@@ -21,7 +21,8 @@ export type IslandViewName =
   | "result"
   | "note"
   | "settings"
-  | "greeting";
+  | "greeting"
+  | "threads";
 
 export type BotStateName =
   | "idle"
@@ -57,6 +58,10 @@ export const PANEL_H = 320;
 export const NOTCH_W = 184;
 export const NOTCH_H = 32;
 export const COMPACT_W = 288; // NOTCH_W + 104
+/** Compact pill when there is nobody else to show: just Mochi. */
+export const COMPACT_SOLO_W = 84;
+/** Compact pill while it flashes the current step. */
+export const COMPACT_LINE_W = 300;
 export const EXPANDED_W = 640;
 
 export const ROUNDED_CORNER = 14; // hidden / compact
@@ -86,6 +91,7 @@ export const VIEW_LAYOUTS: Record<IslandViewName, ViewLayout> = {
   note: { height: 160, botX: 60, botY: null, botDiameter: 50, agentMode: "column" },
   settings: { height: 160, botX: 54, botY: null, botDiameter: 46, agentMode: "none" },
   greeting: { height: 150, botX: 320, botY: 90, botDiameter: 0, agentMode: "none" },
+  threads: { height: 260, botX: 52, botY: null, botDiameter: 44, agentMode: "none" },
 };
 
 // The upload views above are only the fallback geometry. Once a file is actually
@@ -101,6 +107,7 @@ export function islandSize(
   mode: IslandMode,
   view: IslandViewName,
   chatCount = 0,
+  others = 0,
 ): { w: number; h: number } {
   switch (mode) {
     case "hidden":
@@ -108,9 +115,18 @@ export function islandSize(
       // slides into the top edge of the screen instead of sitting there as a bar.
       return { w: NOTCH_W, h: 0 };
     case "compact":
-      return { w: COMPACT_W, h: NOTCH_H };
+      // With a step to show the pill widens for a moment; with no other pills
+      // and nothing to say it shrinks to just the blob.
+      return { w: chatCount > 0 ? COMPACT_LINE_W : others > 0 ? COMPACT_W : COMPACT_SOLO_W, h: NOTCH_H };
     case "expanded": {
-      const h = view === "prompt" ? chatPromptHeight(chatCount) : VIEW_LAYOUTS[view].height;
+      const h =
+        view === "prompt"
+          ? chatPromptHeight(chatCount)
+          : view === "question"
+            ? 150 + Math.max(1, Math.min(4, chatCount)) * 34
+            : view === "threads"
+              ? (chatCount > 0 ? Math.min(290, 140 + Math.min(6, chatCount) * 30) : 160)
+              : VIEW_LAYOUTS[view].height;
       return { w: EXPANDED_W, h };
     }
   }

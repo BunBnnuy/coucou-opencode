@@ -8,3 +8,6 @@
 - The island always reopens after folding, and Settings opens below it, resizable — thanks @rouderz
 - Choose the Claude model for the chat in Settings; the list comes from your Anthropic account, and Claude Sonnet 4.6 stays the default — thanks @rouderz
 - Windows build artifacts are now downloadable from a manual CI run — thanks @MysJofR
+- OpenCode 1 and 2 sessions show up in the island and can be approved from the notch, through one plugin shared by the Mac and Windows apps
+- On Windows the island can be dragged anywhere along the top or bottom edge of the screen — it snaps to the nearest edge and remembers where you left it (Settings → Island edge)
+- Windows theme: Dark / Light / Follow Windows, plus a Mochi colour picker

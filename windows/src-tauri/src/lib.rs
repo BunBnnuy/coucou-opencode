@@ -6,6 +6,7 @@ mod hooks;
 mod integrations;
 mod island;
 mod log;
+mod opencode;
 mod pipe;
 mod secrets;
 mod settings;
@@ -61,12 +62,14 @@ fn boot(app: AppHandle, shared: State<Shared>) -> BootInfo {
 
 #[tauri::command]
 fn save_settings(app: AppHandle, shared: State<Shared>, settings: Settings) {
-    let (screen_changed, autostart_changed) = {
+    let (screen_changed, autostart_changed, position_changed) = {
         let mut current = shared.settings.lock().unwrap();
         let screen_changed = current.screen != settings.screen;
         let autostart_changed = current.autostart != settings.autostart;
+        let position_changed = current.island_anchor != settings.island_anchor
+            || (current.island_offset_x - settings.island_offset_x).abs() > f64::EPSILON;
         *current = settings.clone();
-        (screen_changed, autostart_changed)
+        (screen_changed, autostart_changed, position_changed)
     };
     if let Err(err) = settings::save(&settings) {
         eprintln!("[coucou] could not save settings: {err}");
@@ -78,7 +81,7 @@ fn save_settings(app: AppHandle, shared: State<Shared>, settings: Settings) {
             eprintln!("[coucou] autostart: {err}");
         }
     }
-    if screen_changed {
+    if screen_changed || position_changed {
         let collapsed = shared.gate.collapsed.load(Ordering::Relaxed);
         island::apply_geometry(&app, &settings.screen, collapsed);
     }
@@ -119,6 +122,37 @@ fn reposition(app: AppHandle, shared: State<Shared>) {
     let pref = shared.settings.lock().unwrap().screen.clone();
     let collapsed = shared.gate.collapsed.load(Ordering::Relaxed);
     island::apply_geometry(&app, &pref, collapsed);
+}
+
+/// Window-drag step: move the island by a logical delta. The webview sends
+/// screen-pixel deltas from its pointer events; multiply by the monitor scale.
+#[tauri::command]
+fn move_island_by(app: AppHandle, dx: f64, dy: f64) {
+    let Some(win) = island::window(&app) else { return };
+    let Ok(pos) = win.outer_position() else { return };
+    let scale = win.scale_factor().unwrap_or(1.0);
+    let x = pos.x + (dx * scale).round() as i32;
+    let y = pos.y + (dy * scale).round() as i32;
+    let _ = win.set_position(tauri::PhysicalPosition::new(x, y));
+}
+
+/// Called when a drag of the island window ends: snap to the nearest edge,
+/// remember the horizontal position, and place the window there for real.
+#[tauri::command]
+fn snap_island(app: AppHandle, shared: State<Shared>) {
+    let Some(win) = island::window(&app) else { return };
+    let (Ok(pos), Ok(size)) = (win.outer_position(), win.outer_size()) else { return };
+    let pref = shared.settings.lock().unwrap().screen.clone();
+    let (anchor, offset) = island::nearest_anchor(&app, &pref, pos.x, pos.y, size.width, size.height);
+    {
+        let mut s = shared.settings.lock().unwrap();
+        s.island_anchor = anchor;
+        s.island_offset_x = offset;
+        let _ = settings::save(&s);
+    }
+    let collapsed = shared.gate.collapsed.load(Ordering::Relaxed);
+    island::apply_geometry(&app, &pref, collapsed);
+    let _ = app.emit("settings-changed", shared.settings.lock().unwrap().clone());
 }
 
 #[tauri::command]
@@ -218,9 +252,47 @@ fn hooks_apply(
     Ok(backup)
 }
 
+// ── OpenCode plugin ───────────────────────────────────────────────────────────
+
+#[tauri::command]
+fn opencode_status() -> bool {
+    opencode::installed()
+}
+
+#[tauri::command]
+fn opencode_install() -> Result<String, String> {
+    opencode::install()
+}
+
+#[tauri::command]
+fn opencode_uninstall() -> Result<(), String> {
+    opencode::uninstall()
+}
+
 #[tauri::command]
 fn approval_decision(app: AppHandle, request_id: String, decision: String) {
     pipe::answer(&app, &request_id, &decision);
+}
+
+/// The user clicked an answer in the island's question card.
+#[tauri::command]
+fn question_answer(app: AppHandle, request_id: String, answer: String) {
+    pipe::question_answer(&app, &request_id, &answer);
+}
+
+/// Brings T3 Code forward so a listed conversation can be continued. Its URL
+/// protocol only accepts `/welcome` and `/settings`, so a specific thread cannot
+/// be deep-linked; launching the exe again focuses the running window instead.
+#[tauri::command]
+fn open_t3_thread(_thread_id: String) {
+    let Some(local) = std::env::var_os("LOCALAPPDATA") else { return };
+    let exe = std::path::PathBuf::from(local)
+        .join("Programs")
+        .join("t3code")
+        .join("T3 Code (Alpha).exe");
+    if exe.exists() {
+        let _ = Command::new(exe).spawn();
+    }
 }
 
 /// The island has the card on screen, so the long wait for a human may begin.
@@ -248,8 +320,17 @@ async fn chat_send(
     query: String,
     context: Option<ChatContext>,
 ) -> Result<ChatReply, String> {
-    let model = shared.settings.lock().unwrap().model.clone();
-    claude::send(&chat, &model, query, context).await
+    let (provider, model) = {
+        let s = shared.settings.lock().unwrap();
+        let provider = s.chat_provider.clone();
+        let model = if provider == claude::PROVIDER_OPENCODE {
+            s.opencode_model.clone()
+        } else {
+            s.model.clone()
+        };
+        (provider, model)
+    };
+    claude::send(&chat, &provider, &model, query, context).await
 }
 
 #[tauri::command]
@@ -261,6 +342,14 @@ fn chat_reset(chat: State<Chat>) {
 #[tauri::command]
 fn ingest_file(path: String) -> Result<DroppedFile, String> {
     files::ingest(&path)
+}
+
+/// HTML5 drops hand the page bytes, not a path; the page base64s them because
+/// the IPC is JSON. Same inbox as `ingest_file`.
+#[tauri::command]
+fn ingest_file_base64(name: String, data: String) -> Result<DroppedFile, String> {
+    let bytes = claude::base64_to_bytes(&data).ok_or_else(|| "bad base64 payload".to_string())?;
+    files::ingest_bytes(&name, &bytes)
 }
 
 /// The island may only ask whether a key exists — never read it.
@@ -306,8 +395,7 @@ fn log_line(message: String) {
 /// for the *same* arguments as the island (see `additionalBrowserArgs` in
 /// tauri.conf.json) — a mismatch makes the second window come up blank, with no
 /// error anywhere.
-const BROWSER_ARGS: &str = "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection --autoplay-policy=no-user-gesture-required";
-
+pub(crate) const BROWSER_ARGS: &str = "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection --autoplay-policy=no-user-gesture-required";
 /// In a dev build the pages are served by Vite, so the second window needs the
 /// absolute dev URL; a bundled build resolves it inside the app bundle.
 fn settings_page_url(app: &AppHandle) -> WebviewUrl {
@@ -387,19 +475,27 @@ pub fn run() {
             set_island_rect,
             focus_window,
             reposition,
+            move_island_by,
+            snap_island,
             open_url,
             open_in_vscode,
             quit_app,
             hooks_status,
             hooks_preview,
             hooks_apply,
+            opencode_status,
+            opencode_install,
+            opencode_uninstall,
             approval_decision,
+            question_answer,
+            open_t3_thread,
             approval_ack,
             approval_decline,
             log_line,
             chat_send,
             chat_reset,
             ingest_file,
+            ingest_file_base64,
             secret_present,
             secret_set,
             secret_clear,

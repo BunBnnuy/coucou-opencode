@@ -37,6 +37,11 @@ struct OverviewView: View {
 
     var agent: AgentTask? { state.focusTask }
 
+    /// True when there is another pill to sit next to the main agent.
+    private var hasOtherTasks: Bool {
+        state.tasks.contains { $0.id != state.focusId }
+    }
+
     var body: some View {
         HStack(spacing: 10) {
             // Left card: title row + ticker below + ↗ button overlay
@@ -59,7 +64,7 @@ struct OverviewView: View {
                                     .lineLimit(1)
                                     .truncationMode(.tail)
                                     .layoutPriority(1)
-                                Text(agent.source == .claudeCode ? "Claude Code" : "n8n")
+                                Text(agent.source == .claudeCode ? agent.agentDetail : "n8n")
                                     .font(.system(size: 11))
                                     .foregroundColor(Color(hex: "#8E939C"))
                                     .lineLimit(1)
@@ -103,11 +108,15 @@ struct OverviewView: View {
                     .frame(maxWidth: .infinity, alignment: .trailing)
                 }
             }
-            .frame(width: 322)
+            .frame(width: hasOtherTasks ? 322 : nil)
+            .frame(maxWidth: hasOtherTasks ? nil : .infinity)
 
-            // Right card: agent pills
-            CardBackground(wash: nil) {
-                AgentPillsView(state: state)
+            // Right card: the other pills. Gone when there is nobody else, so the
+            // main agent takes the whole window.
+            if hasOtherTasks {
+                CardBackground(wash: nil) {
+                    AgentPillsView(state: state)
+                }
             }
         }
         .onChange(of: state.focusId) { _, _ in showingN8nDetail = false }
@@ -229,14 +238,17 @@ struct QuestionView: View {
         ZStack {
             CardBackground(wash: .cyan)
             VStack(alignment: .leading, spacing: 5) {
-                AgentWho(task: state.focusTask, label: "Claude Code is asking a question")
-                Text("Which search engine to use?")
+                AgentWho(task: state.focusTask, label: "\(state.focusTask?.agentLabel ?? "Agent") is asking a question")
+                Text(state.pendingQuestion?.text ?? "The agent needs an answer.")
                     .font(.system(size: 15, weight: .semibold))
                 HStack(spacing: 8) {
-                    ForEach(["Postgres full-text", "Meilisearch", "Algolia"], id: \.self) { opt in
-                        SecondaryButton(opt) { /* answer */ }
+                    ForEach(state.pendingQuestion?.options ?? [], id: \.self) { option in
+                        SecondaryButton(option) { /* answered in the terminal */ }
                     }
                 }
+                Text("Answer in the terminal — Coucou can't reply for you yet.")
+                    .font(.system(size: 11))
+                    .foregroundColor(Color(hex: "#8E939C"))
             }
             .padding(.leading, 116)
             .padding(.trailing, 16)
@@ -283,7 +295,7 @@ struct FinishedView: View {
         ZStack {
             CardBackground(wash: .green)
             VStack(alignment: .leading, spacing: 5) {
-                AgentWho(task: state.focusTask, label: "Claude Code finished")
+                AgentWho(task: state.focusTask, label: "\(state.focusTask?.agentLabel ?? "Agent") finished")
                 Text(state.focusTask?.steps.last ?? "Session finished")
                     .font(.system(size: 15, weight: .semibold))
                 HStack(spacing: 8) {
@@ -1083,7 +1095,7 @@ struct IntegrationCardView: View {
                         .foregroundColor(Color(hex: "#F5F6F8"))
                         .lineLimit(1).truncationMode(.tail)
                         .layoutPriority(1)
-                    Text("Claude Code")
+                    Text(task.agentDetail)
                         .font(.system(size: 11))
                         .foregroundColor(Color(hex: "#8E939C"))
                         .lineLimit(1).truncationMode(.tail)
@@ -1114,7 +1126,7 @@ struct IntegrationCardView: View {
                     Circle()
                         .fill(Color(hex: task.color))
                         .frame(width: 7, height: 7)
-                    Text(task.id == "integration_claude" ? "VS Code" : task.name)
+                    Text(task.name)
                         .font(.system(size: 12, weight: .semibold))
                         .foregroundColor(Color(hex: "#F5F6F8"))
                     Text("Integration")
@@ -2277,9 +2289,9 @@ struct AgentPill: View {
     let onTap: () -> Void
     @State private var isHovered = false
 
-    // VS Code pill always shows "VS Code" label regardless of active project name
+    // The pill shows the project name while a session is live, "Agent" when idle.
     private var displayName: String {
-        task.id == "integration_claude" ? "VS Code" : task.name
+        task.name
     }
 
     var body: some View {
@@ -2751,7 +2763,7 @@ struct SettingsIslandView: View {
 
                 // Connection status
                 HStack(spacing: 14) {
-                    StatusBadge(label: "Claude Code", ok: claudeConnected)
+                    StatusBadge(label: "Hooks", ok: claudeConnected)
                     StatusBadge(label: "API", ok: apiConnected)
                     Spacer()
                     Button("Settings…") {

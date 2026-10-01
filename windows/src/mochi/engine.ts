@@ -168,6 +168,8 @@ export class BotEngine {
   isMini = false;
   /** Solid body colour for mini bots / integration pills (null = Mochi gradient). */
   bodyColor: RGB | null = null;
+  /** Base colour for the main blob's gradient (null = the built-in grey). */
+  bodyBase: RGB | null = null;
 
   // Animated state (BotEngine `s`)
   yaw = 0; pitch = 0; roll = 0; tilt = 0; open = 1;
@@ -717,13 +719,18 @@ export class BotEngine {
       x.fill(body);
       return;
     }
+    const top = this.bodyBase ? mix3(this.bodyBase, [1, 1, 1], 0.65) : BASE_TOP;
+    const bottom = this.bodyBase ?? BASE_BOTTOM;
     const g = x.createLinearGradient(rx * 0.7, -ry * 0.85, -rx * 0.8, ry * 0.9);
-    g.addColorStop(0, rgba(BASE_TOP));
-    g.addColorStop(1, rgba(BASE_BOTTOM));
+    g.addColorStop(0, rgba(top));
+    g.addColorStop(1, rgba(bottom));
     x.fillStyle = g;
     x.fill(body);
 
-    const effectiveTint = this.tint * (1 - this.morph);
+    // With a custom body colour the state tint would repaint the blob in odd
+    // shades (blue over yellow reads green); the state colour lives in the glow
+    // behind instead. The default grey keeps the original tint.
+    const effectiveTint = this.bodyBase ? 0 : this.tint * (1 - this.morph);
     if (effectiveTint > 0.01) {
       const tg = x.createLinearGradient(0, ry, 0, -ry);
       tg.addColorStop(0, rgba(this.col, 0.72 * effectiveTint));

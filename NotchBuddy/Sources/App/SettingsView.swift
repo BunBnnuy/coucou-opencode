@@ -169,6 +169,31 @@ struct SettingsView: View {
                     .padding(6)
                 }
 
+                // MARK: OpenCode
+                GroupBox("OpenCode") {
+                    VStack(alignment: .leading, spacing: 10) {
+                        #if APPSTORE
+                        Text("OpenCode support ships with the GitHub build: the App Store sandbox can't reach ~/.config/opencode.")
+                            .font(.system(size: 11))
+                            .foregroundColor(.secondary)
+                        #else
+                        Text("plugin : \(HookServer.openCodePluginPath)")
+                            .font(.system(size: 11, design: .monospaced))
+                            .foregroundColor(.secondary)
+                        Text("Watches OpenCode sessions in the notch and lets you approve from here. Restart OpenCode after installing.")
+                            .font(.system(size: 11))
+                            .foregroundColor(.secondary)
+                        HStack(spacing: 10) {
+                            Button("Install plugin") { installOpenCode() }
+                                .buttonStyle(.borderedProminent)
+                            Button("Uninstall") { uninstallOpenCode() }
+                                .buttonStyle(.bordered)
+                        }
+                        #endif
+                    }
+                    .padding(6)
+                }
+
                 // MARK: Integrations
                 GroupBox("Integrations") {
                     VStack(alignment: .leading, spacing: 14) {
@@ -309,7 +334,7 @@ struct SettingsView: View {
                 GroupBox("Active pills") {
                     VStack(alignment: .leading, spacing: 10) {
                         HStack {
-                            Text("VS Code")
+                            Text("Agent")
                                 .font(.system(size: 12, weight: .semibold))
                             Circle().fill(Color(hex: "#F5F6F8")).frame(width: 8, height: 8)
                             Spacer()
@@ -505,6 +530,24 @@ struct SettingsView: View {
         do {
             try HookServer.shared.uninstallClaudeHooks()
             statusMessage = "✓ Hooks removed."
+        } catch {
+            statusMessage = "❌ \(error.localizedDescription)"
+        }
+    }
+
+    private func installOpenCode() {
+        do {
+            try HookServer.shared.installOpenCodePlugin()
+            statusMessage = "✓ OpenCode plugin installed — restart OpenCode to activate."
+        } catch {
+            statusMessage = "❌ \(error.localizedDescription)"
+        }
+    }
+
+    private func uninstallOpenCode() {
+        do {
+            try HookServer.shared.uninstallOpenCodePlugin()
+            statusMessage = "✓ OpenCode plugin removed."
         } catch {
             statusMessage = "❌ \(error.localizedDescription)"
         }

@@ -20,10 +20,59 @@ pub struct Settings {
     /// Defaulted explicitly so a settings.json written by an older build still loads.
     #[serde(default = "default_model")]
     pub model: String,
+    /// Chat provider: "anthropic" (Claude API) or "opencode" (OpenCode Go/Zen).
+    #[serde(default = "default_provider")]
+    pub chat_provider: String,
+    /// Model used when the chat provider is OpenCode.
+    #[serde(default = "default_opencode_model")]
+    pub opencode_model: String,
+    /// Where the island is attached: "top" or "bottom" (above the taskbar).
+    #[serde(default = "default_anchor")]
+    pub island_anchor: String,
+    /// Horizontal centre as a fraction of the monitor width (0.0–1.0).
+    #[serde(default = "default_offset_x")]
+    pub island_offset_x: f64,
+    /// Island theme: "dark", "light", or "system" (follow Windows).
+    #[serde(default = "default_theme")]
+    pub theme: String,
+    /// How many T3 Code conversations the threads tab lists (1–30).
+    #[serde(default = "default_recent_threads")]
+    pub recent_threads: u32,
+    /// Base colour of the main Mochi blob (hex, e.g. "#C4C5CA").
+    #[serde(default = "default_mochi_color")]
+    pub mochi_color: String,
+}
+
+fn default_mochi_color() -> String {
+    "#C4C5CA".to_string()
+}
+
+fn default_theme() -> String {
+    "dark".to_string()
+}
+
+fn default_recent_threads() -> u32 {
+    10
+}
+
+fn default_anchor() -> String {
+    "top".to_string()
+}
+
+fn default_offset_x() -> f64 {
+    0.5
 }
 
 fn default_model() -> String {
     crate::claude::DEFAULT_MODEL.to_string()
+}
+
+fn default_provider() -> String {
+    crate::claude::PROVIDER_ANTHROPIC.to_string()
+}
+
+fn default_opencode_model() -> String {
+    crate::claude::DEFAULT_OPENCODE_MODEL.to_string()
 }
 
 impl Default for Settings {
@@ -43,6 +92,13 @@ impl Default for Settings {
             autostart: false,
             hooks_installed: false,
             model: default_model(),
+            chat_provider: default_provider(),
+            opencode_model: default_opencode_model(),
+            island_anchor: default_anchor(),
+            island_offset_x: default_offset_x(),
+            theme: default_theme(),
+            recent_threads: default_recent_threads(),
+            mochi_color: default_mochi_color(),
         }
     }
 }

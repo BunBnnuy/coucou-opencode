@@ -74,7 +74,7 @@ fn connect() -> Option<std::fs::File> {
 fn main() {
     let Some((payload, event)) = read_event() else { std::process::exit(0) };
 
-    let waits_for_answer = event == "PermissionRequest";
+    let waits_for_answer = event == "PermissionRequest" || event == "Question";
     let budget = if waits_for_answer { DECISION_BUDGET } else { FIRE_AND_FORGET_BUDGET };
 
     // The worker owns every blocking call. If it overruns the budget we simply
@@ -87,9 +87,17 @@ fn main() {
     });
 
     if let Ok(Some(decision)) = rx.recv_timeout(budget) {
-        if let Some(json) = decision_json(&decision) {
+        // A question's answer is a label the plugin hands straight to OpenCode;
+        // a permission's is translated into the documented hook JSON.
+        let printable = if event == "Question" {
+            let answer = decision.trim();
+            (!answer.is_empty() && answer != "ask").then(|| answer.to_string())
+        } else {
+            decision_json(&decision)
+        };
+        if let Some(text) = printable {
             let mut out = std::io::stdout();
-            let _ = writeln!(out, "{json}");
+            let _ = writeln!(out, "{text}");
             let _ = out.flush();
         }
     }
@@ -169,6 +177,13 @@ fn read_event() -> Option<(String, String)> {
             let value = std::env::var(var).unwrap_or_default();
             map.insert(key.into(), serde_json::Value::String(value));
         }
+    }
+
+    // Name the agent for the island — but never over the OpenCode plugin's own
+    // payload (the old plugin only sends `source`, and "Claude Code" would win).
+    let opencode = map.get("source").and_then(|v| v.as_str()) == Some("opencode");
+    if !opencode && !map.contains_key("agent") {
+        map.insert("agent".into(), serde_json::Value::String("Claude Code".into()));
     }
 
     truncate_strings(&mut payload);

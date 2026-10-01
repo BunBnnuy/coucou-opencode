@@ -8,11 +8,13 @@
   --font: system-ui, "Segoe UI Variable Text", "Segoe UI", sans-serif;
   --mono: "Cascadia Mono", "Consolas", ui-monospace, monospace;
   --ink: #f5f6f8;
+  --ink-rgb: 255, 255, 255;
+  --on-ink: #0b0c0e;
   --dim: #9398a1;
   --dim-2: #6b7079;
   --bg: #0b0c0e;
   --card: #141518;
-  --hairline: rgba(255, 255, 255, 0.07);
+  --hairline: rgba(var(--ink-rgb), 0.07);
   --green: #22c55e;
   --red: #f4505e;
   --amber: #f5a524;
@@ -24,6 +26,20 @@
   padding: 0;
 }
 
+
+/* Light theme: same layout, light window. */
+body.settings-window.theme-light {
+  color-scheme: light;
+
+  --ink: #16181c;
+  --ink-rgb: 22, 24, 28;
+  --on-ink: #f5f6f8;
+  --dim: #5c6270;
+  --dim-2: #6e7480;
+  --bg: #f4f5f7;
+  --card: #ffffff;
+  --hairline: rgba(0, 0, 0, 0.08);
+}
 body.settings-window {
   background: var(--bg);
   color: var(--ink);
@@ -104,14 +120,14 @@ button {
   padding: 7px 14px;
   border: 0;
   border-radius: 999px;
-  background: rgba(255, 255, 255, 0.09);
+  background: rgba(var(--ink-rgb), 0.09);
   color: var(--ink);
   cursor: pointer;
   transition: background 0.14s, transform 0.08s;
 }
 
 button:hover:not(:disabled) {
-  background: rgba(255, 255, 255, 0.15);
+  background: rgba(var(--ink-rgb), 0.15);
 }
 
 button:active:not(:disabled) {
@@ -120,7 +136,7 @@ button:active:not(:disabled) {
 
 button.primary {
   background: var(--ink);
-  color: #0b0c0e;
+  color: var(--on-ink);
 }
 
 button.primary:hover:not(:disabled) {
@@ -150,7 +166,7 @@ code,
   width: 36px;
   height: 20px;
   border-radius: 10px;
-  background: rgba(255, 255, 255, 0.15);
+  background: rgba(var(--ink-rgb), 0.15);
   flex: 0 0 36px;
   padding: 0;
 }
@@ -180,7 +196,7 @@ input[type="range"] {
   appearance: none;
   height: 4px;
   border-radius: 2px;
-  background: rgba(255, 255, 255, 0.2);
+  background: rgba(var(--ink-rgb), 0.2);
   width: 140px;
 }
 
@@ -197,7 +213,7 @@ input[type="text"],
 input[type="password"],
 select {
   font: 400 12.5px var(--font);
-  background: rgba(255, 255, 255, 0.07);
+  background: rgba(var(--ink-rgb), 0.07);
   border: 1px solid var(--hairline);
   border-radius: 8px;
   color: var(--ink);
@@ -211,19 +227,19 @@ input::placeholder {
 input:focus,
 select:focus {
   outline: none;
-  border-color: rgba(255, 255, 255, 0.28);
+  border-color: rgba(var(--ink-rgb), 0.28);
 }
 
 /* The popup is drawn by the OS: give it an explicit pair of colours rather than
    inheriting white on white. */
 select option {
-  background-color: #1a1c20;
+  background-color: var(--card);
   color: var(--ink);
 }
 
 .diff {
   font: 400 11.5px/1.5 var(--mono);
-  background: #08090b;
+  background: var(--bg);
   border: 1px solid var(--hairline);
   border-radius: 10px;
   padding: 10px 12px;

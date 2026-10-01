@@ -2,7 +2,7 @@
 // Mirrors IslandRootView.swift + IslandWindowController.swift.
 
 import { Tracked, Spring, clamp } from "../core/anim";
-import { Bridge, IS_TAURI, onDragDrop } from "../core/bridge";
+import { Bridge, IS_TAURI, onDragDrop, onEvent } from "../core/bridge";
 import {
   EXPANDED_CORNER, EXPANDED_W, NOTCH_W, PANEL_H, PANEL_W,
   ROUNDED_CORNER, VIEW_LAYOUTS, botGlowColor, botGlowOpacity, botPosition, chatPromptHeight,
@@ -14,6 +14,7 @@ import { State } from "../core/state";
 import { BotEngine, hexToRGB } from "../mochi/engine";
 import { Greeting } from "../mochi/greeting";
 import { createMiniBot, pruneMiniBots, syncMiniBotStates, tickMiniBots } from "../mochi/minibots";
+import { applyThemeClass, setMochiColor, systemPrefersLight } from "../core/theme";
 import { UploadCanvas } from "../upload/canvas";
 import { USC, UploadSeq } from "../upload/sequence";
 import { buildHeader, buildViews, type ViewActions, type ViewHost } from "../views/views";
@@ -44,6 +45,7 @@ export class Island {
   private botGlow!: HTMLElement;
   private greetingCanvas!: HTMLCanvasElement;
   private miniGrid!: HTMLElement;
+  private compactLineEl!: HTMLElement;
   private countdown!: HTMLElement;
   private wakeStrip!: HTMLElement;
 
@@ -63,6 +65,8 @@ export class Island {
 
   private running = false;
   private lastFrame = 0;
+  private geometryKey = "";
+  private compactLineClear: number | null = null;
   private dirty = true;
   private canvasPx = 0;
 
@@ -88,6 +92,13 @@ export class Island {
   private uploadTens = 0;
   private uploadDone = false;
 
+  /** Window drag state: we move the window ourselves and snap on release. */
+  private draggingWindow = false;
+  private dragPointer: number | null = null;
+  private dragLast = { x: 0, y: 0 };
+  private dragPending = { dx: 0, dy: 0 };
+  private dragFrame: number | null = null;
+
   constructor(root: HTMLElement) {
     this.root = root;
     this.build();
@@ -98,6 +109,18 @@ export class Island {
     State.subscribe(() => {
       this.dirty = true;
       this.ensureRunning();
+      // The compact pill's step clears itself even after the frame loop has
+      // settled, which is what usually happens before those 2.6 s are up.
+      if (State.compactLine && this.compactLineClear == null) {
+        this.compactLineClear = window.setTimeout(() => {
+          this.compactLineClear = null;
+          State.compactLine = null;
+          State.notify();
+        }, 2600);
+      }
+    });
+    window.matchMedia("(prefers-color-scheme: light)").addEventListener("change", () => {
+      if (State.settings.theme === "system") this.applySettings();
     });
   }
 
@@ -143,11 +166,26 @@ export class Island {
         State.pendingApproval = null;
         State.isPinned = false;
         this.fsm.pinned = false;
-        State.updateTask("integration_claude", "working");
+        State.updateTask("integration_claude", State.pendingQuestion ? "question" : "working");
         State.setPillBadge("integration_claude", null);
         this.setView(State.defaultView());
       },
-      toggleSound: () => {
+      answerQuestion: (label) => {
+        const question = State.pendingQuestion;
+        if (!question?.id) return;
+        void Bridge.questionAnswer(question.id, label);
+        State.pendingQuestion = null;
+        State.isPinned = false;
+        this.fsm.pinned = false;
+        State.updateTask("integration_claude", "working");
+        this.setView(State.defaultView());
+      },
+      openThread: (thread) => {
+        // T3 Code's protocol only accepts /welcome and /settings, so the best we
+        // can do is bring it forward; the thread list is right there.
+        void Bridge.openT3Thread(thread.id);
+        void Bridge.log(`open t3 thread ${thread.id} ${thread.title}`);
+      },      toggleSound: () => {
         State.settings.soundEnabled = !State.settings.soundEnabled;
         Sound.setEnabled(State.settings.soundEnabled);
         void Bridge.saveSettings(State.settings);
@@ -174,6 +212,7 @@ export class Island {
     this.botCanvas = h("canvas", { id: "bot-canvas" });
     this.greetingCanvas = h("canvas", { id: "greeting-canvas" });
     this.miniGrid = h("div", { id: "mini-grid" });
+    this.compactLineEl = h("div", { id: "compact-line" });
     this.countdown = h("div", { id: "countdown" });
 
     this.header = buildHeader(actions);
@@ -208,6 +247,7 @@ export class Island {
       this.botGlow,
       this.botCanvas,
       this.miniGrid,
+      this.compactLineEl,
       this.countdown,
     );
 
@@ -299,6 +339,12 @@ export class Island {
   }
 
   setView(view: IslandViewName) {
+    // While something needs the user, that card is the island: switching tabs
+    // (chat, home, drop) must not lose the question.
+    if (view !== "settings") {
+      if (State.pendingApproval) view = "approval";
+      else if (State.pendingQuestion) view = "question";
+    }
     this.stopSequenceIfLeaving(view);
     if (State.mode !== "expanded") {
       this.fsm.forceHome();
@@ -384,10 +430,9 @@ export class Island {
    * the inbox runs in the background and swaps the path in when it lands, so a
    * slow disk can never stall the animation — same as FileDropHandler on macOS.
    */
-  private swallow(path: string) {
-    const name = path.split(/[\\/]/).pop() || "file";
-    State.droppedFile = { name, path };
-    State.promptContext = { kind: "file", name, path };
+  private beginSwallow(name: string) {
+    State.droppedFile = { name, path: "" };
+    State.promptContext = { kind: "file", name };
     State.chatHistory = [];
     void Bridge.chatReset();
 
@@ -403,21 +448,62 @@ export class Island {
     State.uploadProgress = 0;
     this.setView("uploading");
     this.ensureRunning();
+  }
 
+  private landed(file: { name: string; path: string }) {
+    State.droppedFile = { name: file.name, path: file.path };
+    State.promptContext = { kind: "file", name: file.name, path: file.path };
+    State.notify();
+  }
+
+  private failSwallow(err: unknown) {
+    UploadSeq.deactivate();
+    State.noteMessage = String(err).replace(/^Error:\s*/, "");
+    this.engine.animateMorph(0);
+    this.setView("note");
+    Sound.play("error");
+    window.setTimeout(() => this.setView(State.defaultView()), 2400);
+  }
+
+  private swallow(path: string) {
+    const name = path.split(/[\\/]/).pop() || "file";
+    this.beginSwallow(name);
     void Bridge.ingestFile(path)
-      .then((file) => {
-        State.droppedFile = { name: file.name, path: file.path };
-        State.promptContext = { kind: "file", name: file.name, path: file.path };
-        State.notify();
-      })
-      .catch((err) => {
-        UploadSeq.deactivate();
-        State.noteMessage = String(err).replace(/^Error:\s*/, "");
-        this.engine.animateMorph(0);
-        this.setView("note");
-        Sound.play("error");
-        window.setTimeout(() => this.setView(State.defaultView()), 2400);
-      });
+      .then((file) => this.landed(file))
+      .catch((err) => this.failSwallow(err));
+  }
+
+  /**
+   * A drop handled by the page (see the HTML5 listeners in wireInput). WebView2
+   * owns the Windows drop target, so the bytes arrive here instead of as a path.
+   * Some builds still expose the real path on the File — use it when present.
+   */
+  private async swallowFile(file: File) {
+    const path = (file as unknown as { path?: string }).path;
+    if (!path && file.size > 24 * 1024 * 1024) {
+      this.failSwallow(new Error("That file is over 24 MB — too big for the webview to hand over."));
+      return;
+    }
+    this.beginSwallow(file.name);
+    try {
+      if (path) {
+        this.landed(await Bridge.ingestFile(path));
+      } else {
+        this.landed(await Bridge.ingestFileBase64(file.name, await this.readBase64(file)));
+      }
+    } catch (err) {
+      this.failSwallow(err);
+    }
+  }
+
+  private async readBase64(file: File): Promise<string> {
+    const bytes = new Uint8Array(await file.arrayBuffer());
+    let binary = "";
+    const CHUNK = 0x8000;
+    for (let i = 0; i < bytes.length; i += CHUNK) {
+      binary += String.fromCharCode(...bytes.subarray(i, i + CHUNK));
+    }
+    return btoa(binary);
   }
 
   /**
@@ -450,7 +536,17 @@ export class Island {
   // ── Geometry ────────────────────────────────────────────────────────────────
 
   private targetSize(): { w: number; h: number; r: number } {
-    const { w, h } = islandSize(State.mode, State.view, State.chatHistory.length);
+    // A question card grows with its options; the threads tab with its list;
+    // the prompt grows with the chat; the compact pill widens for its step.
+    const extra =
+      State.mode === "compact"
+        ? (State.compactLine ? 1 : 0)
+        : State.view === "question"
+          ? (State.pendingQuestion?.options.length ?? 1)
+          : State.view === "threads"
+            ? State.t3Threads.length
+            : State.chatHistory.length;
+    const { w, h } = islandSize(State.mode, State.view, extra, State.otherTasks.length);
     const r = State.mode === "expanded" ? EXPANDED_CORNER : ROUNDED_CORNER;
     return { w, h, r };
   }
@@ -475,7 +571,10 @@ export class Island {
     const r = this.radius.value;
     this.islandEl.style.width = `${w}px`;
     this.islandEl.style.height = `${hh}px`;
-    this.islandEl.style.borderRadius = `0 0 ${r}px ${r}px`;
+    // Corners follow the anchored edge: rounded away from the screen edge.
+    this.islandEl.style.borderRadius = this.bottomAnchored()
+      ? `${r}px ${r}px 0 0`
+      : `0 0 ${r}px ${r}px`;
     this.islandEl.style.transform = `translateX(-50%)`;
     // These follow the island as it resizes, so they belong here rather than in
     // the state-driven DOM sync.
@@ -484,7 +583,12 @@ export class Island {
     this.greetingCanvas.style.left = `${(w - EXPANDED_W) / 2}px`;
     this.uploadCanvas.el.style.left = `${(w - EXPANDED_W) / 2}px`;
 
-    const rect = { x: (PANEL_W - w) / 2, y: 0, w, h: hh };
+    const rect = {
+      x: (PANEL_W - w) / 2,
+      y: this.bottomAnchored() ? Math.max(0, PANEL_H - hh) : 0,
+      w,
+      h: hh,
+    };
     const p = this.pushedRect;
     if (Math.abs(p.x - rect.x) > 0.5 || Math.abs(p.w - rect.w) > 0.5 || Math.abs(p.h - rect.h) > 0.5) {
       this.pushedRect = rect;
@@ -496,7 +600,12 @@ export class Island {
   private islandRect(): { x: number; y: number; w: number; h: number } {
     const w = this.width.value;
     const hh = this.height.value;
-    return { x: (PANEL_W - w) / 2, y: 0, w, h: hh };
+    return { x: (PANEL_W - w) / 2, y: this.bottomAnchored() ? Math.max(0, PANEL_H - hh) : 0, w, h: hh };
+  }
+
+  /** True when the island hangs from the bottom edge instead of the top. */
+  private bottomAnchored(): boolean {
+    return State.settings.islandAnchor === "bottom";
   }
 
   // ── Window collapse (hidden → tiny wake strip, zero polling) ────────────────
@@ -544,12 +653,105 @@ export class Island {
       }
     });
 
+    // Dragging the island moves the window. Done here rather than with the OS
+    // move loop, which a non-activating click-through window does not start; the
+    // window is moved from Rust and snapped to the nearest edge on release.
+    this.islandEl.addEventListener("pointerdown", (e) => {
+      if (State.mode !== "expanded" || e.button !== 0) return;
+      if (this.isBotHit(e.clientX, e.clientY)) return;
+      const target = e.target as HTMLElement | null;
+      if (target?.closest("button, input, textarea, select, a, [contenteditable]")) return;
+      this.draggingWindow = true;
+      this.dragPointer = e.pointerId;
+      this.dragLast = { x: e.screenX, y: e.screenY };
+      this.dragPending = { dx: 0, dy: 0 };
+      try {
+        this.islandEl.setPointerCapture(e.pointerId);
+      } catch {
+        // no capture: the drag simply stops at the window edge
+      }
+    });
+    this.islandEl.addEventListener("pointermove", (e) => {
+      if (!this.draggingWindow || e.pointerId !== this.dragPointer) return;
+      this.dragPending.dx += e.screenX - this.dragLast.x;
+      this.dragPending.dy += e.screenY - this.dragLast.y;
+      this.dragLast = { x: e.screenX, y: e.screenY };
+      if (this.dragFrame != null) return;
+      this.dragFrame = window.requestAnimationFrame(() => {
+        this.dragFrame = null;
+        const { dx, dy } = this.dragPending;
+        this.dragPending = { dx: 0, dy: 0 };
+        if (dx !== 0 || dy !== 0) void Bridge.moveIslandBy(dx, dy);
+      });
+    });
+    const endIslandDrag = (e: PointerEvent) => {
+      if (!this.draggingWindow || e.pointerId !== this.dragPointer) return;
+      this.draggingWindow = false;
+      this.dragPointer = null;
+      try {
+        this.islandEl.releasePointerCapture(e.pointerId);
+      } catch {
+        // capture already gone
+      }
+      void Bridge.snapIsland();
+    };
+    this.islandEl.addEventListener("pointerup", endIslandDrag);
+    this.islandEl.addEventListener("pointercancel", endIslandDrag);
+
     window.addEventListener("keydown", (e) => {
       if (e.key === "Escape" && State.mode === "expanded" && !State.isPinned) this.collapse();
       State.lastActivity = performance.now();
     });
 
     void onDragDrop((e) => this.onDragDrop(e));
+
+    // The island's hidden window watches for a cursor coming near it (see
+    // watch_proximity in island.rs) and asks for a peek through this event.
+    void onEvent<null>("wake", () => {
+      if (!State.paused) this.reveal();
+    });
+
+    // HTML5 file drops. On Windows the drag goes to WebView2's own render-host
+    // window in the browser process, where wry's OLE target never sees it; with
+    // dragDropEnabled:false the page receives the events instead, and the bytes
+    // reach Rust over the IPC. The OLE path above stays for platforms that use it.
+    const hasFiles = (e: DragEvent) => Array.from(e.dataTransfer?.types ?? []).includes("Files");
+    window.addEventListener("dragenter", (e) => {
+      if (!hasFiles(e)) return;
+      e.preventDefault();
+      if (State.fileDragOver) return;
+      State.fileDragOver = true;
+      this.engine.animateMorph(1);
+      UploadSeq.enterZone(e.clientX, e.clientY);
+      this.alert("upload");
+    });
+    window.addEventListener("dragover", (e) => {
+      if (!hasFiles(e)) return;
+      e.preventDefault();
+      if (e.dataTransfer) e.dataTransfer.dropEffect = "copy";
+    });
+    window.addEventListener("dragleave", (e) => {
+      if (!State.fileDragOver) return;
+      const inside =
+        e.clientX > 0 && e.clientY > 0 && e.clientX < window.innerWidth && e.clientY < window.innerHeight;
+      if (inside) return;
+      State.fileDragOver = false;
+      this.engine.animateMorph(0);
+      UploadSeq.exitZone();
+      State.notify();
+    });
+    window.addEventListener("drop", (e) => {
+      if (!hasFiles(e)) return;
+      e.preventDefault();
+      State.fileDragOver = false;
+      const file = e.dataTransfer?.files?.[0];
+      if (!file) {
+        this.engine.animateMorph(0);
+        this.setView(State.defaultView());
+        return;
+      }
+      void this.swallowFile(file);
+    });
 
     // Outside Tauri (plain browser) drive the cursor from DOM events so the
     // island can be inspected with `npm run dev`.
@@ -671,6 +873,19 @@ export class Island {
     const dt = Math.min(0.05, (nowMs - this.lastFrame) / 1000);
     this.lastFrame = nowMs;
 
+    // The compact pill's step expires on its own, a moment after it appeared.
+    // (Scheduled from the state subscription; see the constructor.)
+
+    // The target follows the state on its own: the compact step line, a growing
+    // question card and the threads list all change the size without a view
+    // switch, so the target is watched here rather than at each call site.
+    const target = this.targetSize();
+    const key = `${target.w}x${target.h}`;
+    if (key !== this.geometryKey) {
+      this.geometryKey = key;
+      this.animateGeometry(target.h < this.height.value);
+    }
+
     this.width.step(dt, nowMs);
     this.height.step(dt, nowMs);
     this.radius.step(dt, nowMs);
@@ -747,6 +962,9 @@ export class Island {
       const d = p.diameter;
       const color = botGlowColor(State.effectiveState);
       this.botGlow.style.display = "block";
+      // Behind the blob, centred on it: the state colour shows as an aura and
+      // never paints the body (the engine skips the body tint when a custom
+      // Mochi colour is set, so a blue state cannot turn a yellow blob green).
       this.botGlow.style.width = `${d * 2.2}px`;
       this.botGlow.style.height = `${d * 2.2}px`;
       this.botGlow.style.left = `${this.botCx.value - d * 1.1}px`;
@@ -777,7 +995,10 @@ export class Island {
     if (!ctx) return;
 
     const focus = State.focusTask;
-    this.engine.bodyColor = focus?.isIntegration ? hexToRGB(focus.color) : null;
+    // Only the other integration pills wear their own flat colour. The agent
+    // pill is Mochi itself, so it keeps the (customisable) body gradient.
+    this.engine.bodyColor =
+      focus?.isIntegration && focus.id !== "integration_claude" ? hexToRGB(focus.color) : null;
     this.engine.particleOverhang = BOT_OVERHANG;
     this.engine.lookX = this.lookX();
     this.engine.lookY = this.lookY();
@@ -849,8 +1070,14 @@ export class Island {
       }
     }
 
-    // Compact mini grid
-    const showGrid = State.mode === "compact";
+    // The compact pill's transient step: shown for a moment when the island is
+    // shrunk and something is happening, then gone again.
+    const compactLine = State.mode === "compact" ? State.compactLine : null;
+    if (compactLine) this.compactLineEl.textContent = compactLine;
+    this.compactLineEl.style.opacity = compactLine ? "1" : "0";
+
+    // Compact mini grid (the transient step takes its place while it shows)
+    const showGrid = State.mode === "compact" && State.compactLine == null;
     this.miniGrid.style.opacity = showGrid ? "1" : "0";
     if (showGrid) {
       const others = State.otherTasks.slice(0, 4);
@@ -874,6 +1101,14 @@ export class Island {
     Sound.setEnabled(State.settings.soundEnabled);
     Sound.setVolume(State.settings.soundVolume);
     this.fsm.homeToPetitDelay = State.settings.autoCloseInterval;
+    document.body.classList.toggle("anchor-bottom", this.bottomAnchored());
+    applyThemeClass(State.settings.theme ?? "dark", systemPrefersLight());
+    setMochiColor(State.settings.mochiColor);
+    this.engine.bodyBase = /^#?[0-9a-f]{6}$/i.test((State.settings.mochiColor ?? "").trim())
+      ? hexToRGB(State.settings.mochiColor)
+      : null;
+    this.applyGeometry();
+    void Bridge.reposition();
     State.notify();
   }
 

@@ -36,6 +36,13 @@ struct ApprovalInfo: Sendable {
     var command: String
 }
 
+/// A question the agent is waiting on (OpenCode's question tool).
+struct PendingQuestion: Sendable {
+    var id: String
+    var text: String
+    var options: [String]
+}
+
 // MARK: - Pill badge (shown on pill edge when non-focused task has an alert)
 
 enum PillBadge { case approval, finished, error }
@@ -55,6 +62,17 @@ struct AgentTask: Identifiable, Equatable {
     var miniEye: EyeShape? = nil
     var pillBadge: PillBadge? = nil  // alert badge shown on pill when not focused
     var sessionCwd: String?  = nil  // last known working directory (Claude Code sessions)
+    var agentName: String?   = nil  // "OpenCode", … — nil means Claude Code
+    var agentModel: String?  = nil  // model id, when the agent told us one
+
+    /// What the island calls the agent driving this task.
+    var agentLabel: String { agentName ?? "Agent" }
+
+    /// Agent plus model, when the model is known — shown in the ticker header.
+    var agentDetail: String {
+        guard let model = agentModel, !model.isEmpty else { return agentLabel }
+        return "\(agentLabel) · \(model)"
+    }
 }
 
 enum AgentSource: Equatable {

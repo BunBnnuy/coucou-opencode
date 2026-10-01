@@ -67,6 +67,56 @@ pub fn ingest(source: &str) -> Result<DroppedFile, String> {
     })
 }
 
+/// HTML5 drops hand the page bytes rather than a path, so this is the second
+/// way into the inbox. Same uniqueness and sweep rules as `ingest`.
+pub fn ingest_bytes(name: &str, bytes: &[u8]) -> Result<DroppedFile, String> {
+    let dir = inbox_dir();
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+
+    let name = sanitize_name(name);
+    let mut dest = dir.join(&name);
+    if dest.exists() {
+        let path = Path::new(&name);
+        let stem = path.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+        let ext = path.extension().map(|s| format!(".{}", s.to_string_lossy())).unwrap_or_default();
+        for i in 2..1000 {
+            let candidate = dir.join(format!("{stem} ({i}){ext}"));
+            if !candidate.exists() {
+                dest = candidate;
+                break;
+            }
+        }
+    }
+
+    std::fs::write(&dest, bytes).map_err(|e| format!("cannot write: {e}"))?;
+    if let Ok(file) = std::fs::File::options().write(true).open(&dest) {
+        let _ = file.set_modified(SystemTime::now());
+    }
+    sweep(&dir);
+
+    let landed = dest.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or(name);
+    Ok(DroppedFile {
+        name: landed,
+        path: dest.to_string_lossy().to_string(),
+        size: bytes.len() as u64,
+    })
+}
+
+/// A browser-supplied name must stay a name: no separators, no traversal, no
+/// characters Windows refuses in a file name.
+fn sanitize_name(name: &str) -> String {
+    let base = name.rsplit(['\\', '/']).next().unwrap_or("file").trim();
+    let clean: String = base
+        .chars()
+        .filter(|c| !c.is_control() && !matches!(c, '<' | '>' | ':' | '"' | '|' | '?' | '*'))
+        .collect();
+    if clean.is_empty() || clean == "." || clean == ".." {
+        "file".into()
+    } else {
+        clean
+    }
+}
+
 /// Drops anything copied here more than a week ago. `ingest` stamps every copy
 /// with the time it landed, so this really is the age of the copy and not the
 /// age of whatever the user happened to drag in.

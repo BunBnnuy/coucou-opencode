@@ -5,13 +5,21 @@
 
 import { Bridge, onEvent } from "../core/bridge";
 import { Sound } from "../core/sound";
-import { State } from "../core/state";
+import { State, type T3Thread } from "../core/state";
 import type { Island } from "./island";
 
 const CLAUDE_ID = "integration_claude";
 
 /** Clears the approval card if no decision was made before the hook gave up. */
 let pendingTimeout: number | null = null;
+
+/** The compact pill's transient step, cleared by the island's frame loop. */
+function showCompactLine(text: string) {
+  if (State.mode === "expanded" || State.paused) return;
+  State.compactLine = text;
+  State.compactLineAt = performance.now();
+  State.notify();
+}
 
 interface HookPayload {
   hook_event_name?: string;
@@ -23,6 +31,17 @@ interface HookPayload {
   prompt?: string;
   tool_name?: string;
   tool_input?: Record<string, unknown>;
+  /** Options of an OpenCode question (`Question`). */
+  question_options?: { label?: string; description?: string }[];
+  /** Recent T3 Code conversations (`T3Threads`). */
+  threads?: T3Thread[];
+  /** Which agent sent this: the OpenCode plugin sets it, Claude Code doesn't. */
+  agent?: string;
+  /** Model: SessionStart's `model`, or PostModelSwitch's `to_model`. */
+  model?: string;
+  to_model?: string;
+  /** The OpenCode plugin's marker; Claude Code's source is a session-start reason. */
+  source?: string;
 }
 
 const PROJECT_ALIASES: Record<string, string> = {
@@ -57,6 +76,19 @@ const TOOL_LABELS: Record<string, string> = {
   MultiEdit: "Modifie",
   NotebookEdit: "Notebook",
   PowerShell: "Exécute",
+  // OpenCode sends lower-case tool ids; the plugin maps most of them, but a
+  // fallback keeps an unmapped tool readable.
+  bash: "Exécute",
+  read: "Lit",
+  write: "Écrit",
+  edit: "Modifie",
+  glob: "Cherche",
+  grep: "Recherche",
+  webfetch: "Récupère",
+  websearch: "Recherche web",
+  todowrite: "Tâches",
+  task: "Agent",
+  list: "Liste",
 };
 
 function stepLabel(tool: string, input: Record<string, unknown>): string {
@@ -101,11 +133,14 @@ function approvalTarget(tool: string, input: Record<string, unknown>): string {
   return tool;
 }
 
-function upsert(projectName: string, cwd: string) {
+function upsert(projectName: string, cwd: string, agent?: string, model?: string) {
   const t = State.tasks.find((x) => x.id === CLAUDE_ID);
   if (!t) return;
   t.name = projectName;
   if (cwd) t.sessionCwd = cwd;
+  // nil = Claude Code (its relay never sends `agent`); OpenCode sends its name.
+  t.agentName = agent ?? null;
+  t.agentModel = model ?? null;
 }
 
 function clearSession() {
@@ -113,8 +148,10 @@ function clearSession() {
   if (!t) return;
   t.steps = [];
   t.stepIndex = 0;
-  t.name = "VS Code";
+  t.name = "Agent";
   t.pillBadge = null;
+  t.agentName = null;
+  t.agentModel = null;
 }
 
 export function registerHookHandlers(island: Island) {
@@ -134,7 +171,24 @@ function handleHook(island: Island, payload: HookPayload) {
   const cwd = payload.cwd ?? "";
   const raw = lastPathComponent(cwd);
   const projectName = aliasProjectName(raw || "Session");
+  // The OpenCode plugin names itself, or is recognised by its `source` marker.
+  const agent = payload.agent ?? (payload.source === "opencode" ? "OpenCode" : undefined);
   const focused = State.focusId === CLAUDE_ID;
+
+  // A pending question owns the island: another session working must not steal
+  // its state — that is what used to make the question (and the floating blob)
+  // vanish mid-question. An approval still takes over; it is a quick yes/no.
+  const setState = (next: Parameters<typeof State.updateTask>[1]) => {
+    if (State.pendingQuestion && next !== "question" && next !== "approval") return;
+    State.updateTask(CLAUDE_ID, next);
+  };
+
+  // A step both lands in the ticker and, while the island is shrunk, flashes in
+  // the pill for a couple of seconds so progress is visible.
+  const noteStep = (text: string) => {
+    State.appendStep(CLAUDE_ID, text);
+    showCompactLine(text);
+  };
 
   /** Alerts force the island open; work events only reveal the compact island. */
   const surface = (view: Parameters<Island["alert"]>[0], isAlert: boolean) => {
@@ -149,82 +203,130 @@ function handleHook(island: Island, payload: HookPayload) {
 
   switch (name) {
     case "SessionStart":
-      upsert(projectName, cwd);
+      upsert(projectName, cwd, agent, payload.model ?? payload.to_model);
       surface("overview", false);
       Sound.play("work");
       break;
 
     case "UserPromptSubmit": {
-      upsert(projectName, cwd);
-      State.updateTask(CLAUDE_ID, "thinking");
+      upsert(projectName, cwd, agent, payload.model ?? payload.to_model);
+      setState("thinking");
       // The field is `prompt`; reading `message` meant this step was always blank.
       const asked = payload.prompt ?? payload.message;
-      if (asked) State.appendStep(CLAUDE_ID, asked.slice(0, 60));
+      if (asked) noteStep(asked.slice(0, 60));
       surface("overview", false);
       break;
     }
 
     case "PreToolUse": {
-      upsert(projectName, cwd);
-      State.updateTask(CLAUDE_ID, "working");
+      upsert(projectName, cwd, agent, payload.model ?? payload.to_model);
+      setState("working");
       const tool = payload.tool_name ?? "Tool";
-      State.appendStep(CLAUDE_ID, stepLabel(tool, payload.tool_input ?? {}));
+      noteStep(stepLabel(tool, payload.tool_input ?? {}));
       surface("overview", false);
       break;
     }
 
     case "PostToolUse":
-      State.updateTask(CLAUDE_ID, "working");
+      setState("working");
       break;
 
     case "PostToolUseFailure":
-      State.updateTask(CLAUDE_ID, "working");
-      State.appendStep(CLAUDE_ID, "⚠ failed");
+      setState("working");
+      noteStep("⚠ failed");
       break;
 
     case "Notification": {
       const message = payload.message ?? "";
       const lower = message.toLowerCase();
       if (lower.includes("rate limit") || lower.includes("limite d")) {
-        State.updateTask(CLAUDE_ID, "ratelimit");
+        setState("ratelimit");
         Sound.play("rate");
       } else if (message.endsWith("?")) {
-        State.updateTask(CLAUDE_ID, "question");
-        State.appendStep(CLAUDE_ID, message);
+        setState("question");
+        noteStep(message);
       }
       break;
     }
 
+    // The threads tab's data: the latest T3 conversations.
+    case "T3Threads": {
+      State.t3Threads = payload.threads ?? [];
+      State.notify();
+      break;
+    }
+
+    // An assistant reply (T3 Code conversations, forwarded by the watcher).
+    case "AgentMessage": {
+      upsert(projectName, cwd, agent, payload.model ?? payload.to_model);
+      setState("working");
+      const reply = (payload.message ?? "").replace(/\s+/g, " ").trim();
+      if (reply) noteStep(reply.slice(0, 90));
+      break;
+    }
+
+    // The agent is asking something (OpenCode's question tool).
+    case "Question": {
+      upsert(projectName, cwd, agent, payload.model ?? payload.to_model);
+      State.pendingQuestion = {
+        id: payload.request_id ?? "",
+        text: payload.message ?? "A question needs an answer.",
+        options: (payload.question_options ?? []).map((option) => ({
+          label: option.label ?? "",
+          description: option.description ?? "",
+        })),
+      };
+      // "The card is up": the relay can keep waiting for a click.
+      if (payload.request_id) void Bridge.approvalAck(payload.request_id);
+      setState("question");
+      State.isPinned = true;
+      Sound.play("approval");
+      island.alert("question");
+      break;
+    }
+
+    // Answered or rejected, here or in the terminal: drop the card.
+    case "QuestionEnd": {      const pending = State.pendingQuestion;
+      if (!pending) break;
+      if (payload.request_id && pending.id && payload.request_id !== pending.id) break;
+      State.pendingQuestion = null;
+      State.isPinned = false;
+      island.dropPin();
+      setState("working");
+      if (State.view === "question") island.setView(State.defaultView());
+      break;
+    }
+
     case "Stop":
-      State.updateTask(CLAUDE_ID, "finished");
-      if (payload.message) State.appendStep(CLAUDE_ID, payload.message.slice(0, 60));
+      setState("finished");
+      if (payload.message) noteStep(payload.message.slice(0, 60));
       Sound.play("finish");
       if (focused) surface("finished", true);
       else State.setPillBadge(CLAUDE_ID, "finished");
       window.setTimeout(() => {
-        State.updateTask(CLAUDE_ID, "idle");
+        setState("idle");
         State.setPillBadge(CLAUDE_ID, null);
       }, 5200);
       break;
 
     case "StopFailure":
-      State.updateTask(CLAUDE_ID, "error");
+      setState("error");
       Sound.play("error");
       if (focused) surface("error", true);
       else State.setPillBadge(CLAUDE_ID, "error");
       break;
 
     case "SessionEnd":
-      State.updateTask(CLAUDE_ID, "idle");
+      setState("idle");
       clearSession();
       break;
 
     case "SubagentStart":
-      State.appendStep(CLAUDE_ID, "+ subagent");
+      noteStep("+ subagent");
       break;
 
     case "SubagentStop":
-      State.appendStep(CLAUDE_ID, "• subagent done");
+      noteStep("• subagent done");
       break;
 
     case "PermissionRequest": {
@@ -236,7 +338,7 @@ function handleHook(island: Island, payload: HookPayload) {
         if (requestId) void Bridge.approvalDecline(requestId);
         break;
       }
-      upsert(projectName, cwd);
+      upsert(projectName, cwd, agent, payload.model ?? payload.to_model);
       if (pendingTimeout != null) window.clearTimeout(pendingTimeout);
       const tool = payload.tool_name ?? "Tool";
       const input = payload.tool_input ?? {};
@@ -249,7 +351,7 @@ function handleHook(island: Island, payload: HookPayload) {
       // The relay's short ack window closes in 800 ms; everything below this
       // line is synchronous, so the card really is up by the time it lands.
       if (requestId) void Bridge.approvalAck(requestId);
-      State.updateTask(CLAUDE_ID, "approval");
+      setState("approval");
       State.isPinned = true;
       Sound.play("approval");
       if (focused) {
@@ -269,7 +371,7 @@ function handleHook(island: Island, payload: HookPayload) {
         State.pendingApproval = null;
         State.isPinned = false;
         island.dropPin();
-        State.updateTask(CLAUDE_ID, "working");
+        setState("working");
         State.setPillBadge(CLAUDE_ID, null);
         if (State.view === "approval") island.setView(State.defaultView());
         State.notify();
